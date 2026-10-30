@@ -106,3 +106,37 @@ jobs:
           fi
           gh release edit "$RELEASE_TAG" --notes-file ../release-notes.md
           gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber
+
+  metal-runtime-tool:
+    name: Build standalone Metal runtime test (Intel)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compile and sign Metal diagnostic executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/metal-test
+          xcrun clang -fobjc-arc -Wall -Wextra -O2 -mmacosx-version-min=11.0 \
+            tools/metal-runtime-check.m \
+            -framework Foundation -framework Metal \
+            -o build/metal-test/MetalRuntimeCheck
+          codesign --force --sign - build/metal-test/MetalRuntimeCheck
+          codesign --verify --verbose build/metal-test/MetalRuntimeCheck
+          file build/metal-test/MetalRuntimeCheck
+          shasum -a 256 build/metal-test/MetalRuntimeCheck > build/metal-test/SHA256SUMS.txt
+          cat build/metal-test/SHA256SUMS.txt
+      - name: Upload Metal diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: MetalRuntimeDiagnostic
+          path: |
+            build/metal-test/MetalRuntimeCheck
+            build/metal-test/SHA256SUMS.txt
+          if-no-files-found: error
