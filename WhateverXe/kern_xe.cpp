@@ -8,6 +8,7 @@
 //
 
 #include "kern_xe.hpp"
+#include "kern_tgl_pmap_call.hpp"
 #include "kern_framebuffer_donor.hpp"
 #include "kern_xelp_os.hpp"
 #include "kern_alderlake_n.hpp"
@@ -2069,7 +2070,6 @@ static void tglPrepareSequoiaMMIOUC(KernelPatcher &patcher,IOPCIDevice *pci) {
  const uint8_t create[] {0x8B,0x75,0xB4,0x89,0xF1,0x83,0xE1,0x01,0x48,0x09,0xD1,0x40,0xF6,0xC6,0x02};
  const uint8_t update[] {0x8B,0x55,0xB4,0x89,0xD0,0x83,0xE0,0x01,0x48,0x09,0xC8,0xF6,0xC2,0x02};
  const uint8_t protectFrame[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28};
- const uint8_t protectCall[] {0xE8,0x71,0xCB,0x02,0x00};
  uint32_t lo,hi;asm volatile("rdmsr" : "=a"(lo),"=d"(hi) : "c"(0x277));
  const uint64_t pat=static_cast<uint64_t>(hi)<<32|lo;
  bool ok=tglVM.enabled && tglPrepareMMIOBAR(bar) &&
@@ -2082,14 +2082,15 @@ static void tglPrepareSequoiaMMIOUC(KernelPatcher &patcher,IOPCIDevice *pci) {
   !memcmp(reinterpret_cast<void *>(fn+0x1390),create,sizeof(create)) &&
   !memcmp(reinterpret_cast<void *>(fn+0x1030),update,sizeof(update)) &&
   !memcmp(reinterpret_cast<void *>(protect),protectFrame,sizeof(protectFrame)) &&
-  !memcmp(reinterpret_cast<void *>(protect+0xCA),protectCall,sizeof(protectCall)) &&
+  tglSequoiaPmapCallMatches(protect+0xCA,fn) &&
   tglVMRead(kernelMap,tglKernelMap) && (tglKernelMap>>47)==0x1FFFF;
  uint64_t guard[20] {1,tglVM.enabled,tglVM.pciBAR,bar ? bar->getLength() : 0,pat,bool(fn),bool(protect),bool(kernelMap)};
  if(fn && protect) {
-  const uintptr_t sites[] {fn,fn+0x159,fn+0x35,fn+0x52,fn+0xB8,fn+0x1390,fn+0x1030,protect,protect+0xCA};
-  const uint8_t *bytes[] {frame,flags,args,protection,nonEPT,create,update,protectFrame,protectCall};
-  const size_t lengths[] {sizeof(frame),sizeof(flags),sizeof(args),sizeof(protection),sizeof(nonEPT),sizeof(create),sizeof(update),sizeof(protectFrame),sizeof(protectCall)};
-  for(unsigned i=0;i<9;++i)guard[8+i]=!memcmp(reinterpret_cast<void *>(sites[i]),bytes[i],lengths[i]);
+  const uintptr_t sites[] {fn,fn+0x159,fn+0x35,fn+0x52,fn+0xB8,fn+0x1390,fn+0x1030,protect};
+  const uint8_t *bytes[] {frame,flags,args,protection,nonEPT,create,update,protectFrame};
+  const size_t lengths[] {sizeof(frame),sizeof(flags),sizeof(args),sizeof(protection),sizeof(nonEPT),sizeof(create),sizeof(update),sizeof(protectFrame)};
+  for(unsigned i=0;i<8;++i)guard[8+i]=!memcmp(reinterpret_cast<void *>(sites[i]),bytes[i],lengths[i]);
+  guard[16]=tglSequoiaPmapCallMatches(protect+0xCA,fn);
  }
  guard[17]=kernelMap && tglVMRead(kernelMap,tglKernelMap);guard[18]=tglKernelMap;guard[19]=ok;
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSequoiaMMIOGuard",guard,sizeof(guard));

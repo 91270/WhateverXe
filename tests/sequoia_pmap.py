@@ -28,12 +28,17 @@ if a.kernel:
  sites={}
  for base,offset,name in re.findall(r'!memcmp\(reinterpret_cast<void \*>\((fn|protect)(\+0x[0-9A-Fa-f]+)?\),([A-Za-z]+),sizeof',block):
   sites[name]=(0 if base=='fn' else 0xffffff80003ffc50-0xffffff800042c890)+(int(offset[1:],16) if offset else 0)
- assert len(sites)==9,sites
+ assert len(sites)==8,sites
  for name,offset in sites.items():
   values=re.search(r'const uint8_t '+name+r'\[\] \{([^}]+)\}',block)[1]
   values=bytes(int(v.strip(),0) for v in values.split(','))
   assert read(0xffffff800042c890+offset,len(values))==values,name
- print('PASS: exact kernel SHA and all 9 runtime guards')
+ # Ninth guard verifies the decoded CALL target instead of the rel32 byte pattern.
+ assert 'tglSequoiaPmapCallMatches(protect+0xCA,fn)' in block
+ callsite=0xffffff80003ffc50+0xCA
+ call=read(callsite,5)
+ assert call[0]==0xE8 and callsite+5+struct.unpack_from('<i',call,1)[0]==0xffffff800042c890
+ print('PASS: exact kernel SHA, 8 byte guards and CALL target')
 cpp=r'''#include <stdint.h>
 #include <initializer_list>
 #include <string.h>
