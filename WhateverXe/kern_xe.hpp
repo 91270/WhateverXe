@@ -839,6 +839,8 @@ private:
 	static void wrapTGLHangRingDump(void *ring, void *registers);
 	mach_vm_address_t orgTGLRecovery {};
 	static void wrapTGLRecovery(void *channel);
+	mach_vm_address_t orgTGLPipeControlSubmit {};
+	static void wrapTGLPipeControlSubmit(void *channel,void *descriptor);
 	static void wrapTGLFastCopy(void *context, void *params, const void *rects, void *workarounds);
 	mach_vm_address_t orgTGLHostSubmit {}, orgTGLHostWait {}, orgTGLHostCSB {}, orgTGLHostCSBPanic {}, orgTGLHostCSBIDPanic {};
 	mach_vm_address_t orgTGLHostIRQEnable {}, orgTGLHostIRQClassEnable {}, orgTGLHostIRQClassDisable {};

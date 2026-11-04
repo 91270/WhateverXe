@@ -80,6 +80,7 @@
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
 #include "kern_tgl_recovery_gate.hpp"
+#include "kern_tgl_pipe_control_wa.hpp"
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -325,6 +326,19 @@ void XE::wrapTGLRecovery(void *channel) {
 	}
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
 }
+
+namespace {
+uint64_t tglPCWAStats[4] {}; // submissions, candidates, patched, concurrent changes
+bool tglPCWASerialize(void *,void *,OSSerialize *serializer) {
+    uint64_t values[5] {1409226450};
+    for (unsigned i=0;i<4;++i)
+        values[i+1]=__atomic_load_n(tglPCWAStats+i,__ATOMIC_RELAXED);
+    auto data=OSData::withBytes(values,sizeof(values));
+    if(!data)return false;
+    const bool ok=data->serialize(serializer);data->release();return ok;
+}
+}
+
 
 extern "C" {
 	uintptr_t tglCCSPSResume;
@@ -691,6 +705,7 @@ struct TGLVMBoundary {
  uint64_t (*nofault)(uint64_t,uint64_t,uint64_t) {};
  bool enabled {};
 } tglVM;
+
 bool tglVMRead(uint64_t address,uint64_t &value) {
  return (address>>47)==0x1FFFF && tglVM.nofault &&
   tglVM.nofault(address,reinterpret_cast<uint64_t>(&value),sizeof(value))==sizeof(value);
@@ -3822,6 +3837,37 @@ extern "C" __attribute__((naked, used)) void tglGuCDMAWriteBridge() {
 		"popq %r11\n popq %r10\n popq %r9\n popq %r8\n popq %rdi\n popq %rsi\n"
 		"popq %rdx\n popq %rcx\n popq %rax\n popfq\n"
 		"jmpq *_tglGuCDMAWriteResume(%rip)\n");
+}
+
+void XE::wrapTGLPipeControlSubmit(void *channel,void *descriptor) {
+    // The exact TGL FIFO method is called before its native ring submission.
+    // It owns a writable CPU command pool pointer at descriptor+0x20.
+    __atomic_fetch_add(tglPCWAStats,1ULL,__ATOMIC_RELAXED);
+    if(descriptor && tglVM.nofault) {
+        const uint64_t info=reinterpret_cast<uintptr_t>(descriptor);
+        uint64_t cpu=0;
+        uint32_t dwords=0;
+        if(tglVM.nofault(info+0x20,reinterpret_cast<uintptr_t>(&cpu),sizeof(cpu))==sizeof(cpu) &&
+           tglVM.nofault(info+0x30,reinterpret_cast<uintptr_t>(&dwords),sizeof(dwords))==sizeof(dwords) &&
+           dwords==TGLPipeControlWA::BatchDwords &&
+           (cpu>>47)==0x1FFFF && !(cpu&3) &&
+           cpu<=UINT64_MAX-TGLPipeControlWA::BatchDwords*sizeof(uint32_t)) {
+            uint32_t sample[TGLPipeControlWA::BatchDwords] {};
+            if(tglVM.nofault(cpu,reinterpret_cast<uintptr_t>(sample),sizeof(sample))==sizeof(sample) &&
+               TGLPipeControlWA::matches(sample,dwords)) {
+                __atomic_fetch_add(tglPCWAStats+1,1ULL,__ATOMIC_RELAXED);
+                auto word=reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(cpu))+
+                    TGLPipeControlWA::StallFlags;
+                uint32_t native=TGLPipeControlWA::NativeStallFlags;
+                if(__atomic_compare_exchange_n(word,&native,TGLPipeControlWA::RevisedStallFlags,
+                                               false,__ATOMIC_RELEASE,__ATOMIC_RELAXED))
+                    __atomic_fetch_add(tglPCWAStats+2,1ULL,__ATOMIC_RELAXED);
+                else
+                    __atomic_fetch_add(tglPCWAStats+3,1ULL,__ATOMIC_RELAXED);
+            }
+        }
+    }
+    FunctionCast(wrapTGLPipeControlSubmit,callbackXE->orgTGLPipeControlSubmit)(channel,descriptor);
 }
 
 void XE::init() {
@@ -11928,6 +11974,45 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);
+            // Gen12 WA 1409226450 trial, restricted to the exact 82GM B0
+            // board, Sequoia donor and witnessed 216-byte command template.
+            // Opt-in only; no writable user binary or global flush changes.
+            const bool pcWARequested=!adlnDetected &&
+                XELP::kernelOS(version)==XELP::OS::Sequoia &&
+                xeProfile.identity==0x9A498086 && xeProfile.revision==1 &&
+                !xeProfile.overridden() &&
+                checkKernelArgument("-disablegfxfirmware") &&
+                checkKernelArgument("-wex-tgl-pc-wa");
+            bool pcWAReady=false;
+            if(pcWARequested) {
+                const char *submit="__ZN18IGAccelFIFOChannel12submitBufferEP24IOAccelCommandDescriptor";
+                const uint8_t head[] {
+                    0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,
+                    0x48,0x83,0xEC,0x18,0x48,0x8B,0x47,0x18,0xF6,0x80,0x78,0x0C,0,0,0x02
+                };
+                const uint8_t commandPoolLoad[] {
+                    0x49,0x8B,0x46,0x20,0x48,0x85,0xC0,0x0F,0x84,0x8E,0,0
+                };
+                const uint8_t ringSubmitLoad[] {
+                    0x49,0x8B,0x76,0x18,0x49,0x8B,0x4E,0x20,0x45,0x8B,0x46,0x30
+                };
+                pcWAReady=hostOK && tglVM.enabled && tglVM.nofault && size>0x4C9A0 &&
+                    patcher.solveSymbol<mach_vm_address_t>(index,submit,address,size)==address+0x4C6C6 &&
+                    !memcmp(reinterpret_cast<void *>(address+0x4C6C6),head,sizeof(head)) &&
+                    !memcmp(reinterpret_cast<void *>(address+0x4C710),commandPoolLoad,sizeof(commandPoolLoad)) &&
+                    !memcmp(reinterpret_cast<void *>(address+0x4C830),ringSubmitLoad,sizeof(ringSubmitLoad));
+                patcher.clearError();
+                if(pcWAReady) {
+                    KernelPatcher::RouteRequest hook[] {{submit,wrapTGLPipeControlSubmit,orgTGLPipeControlSubmit}};
+                    pcWAReady=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
+                }
+                patcher.clearError();
+                if(pcWAReady) if(auto live=OSSerializer::forTarget(nullptr,tglPCWASerialize)) {
+                    IORegistryEntry::getRegistryRoot()->setProperty("TGLPCWALive",live);live->release();
+                }
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLPCWARequested",pcWARequested);
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLPCWAReady",pcWARequested && pcWAReady);
 			tglAcceleratorReady = surfaceABIReady && adlnObserved && skuReady && urbReady && ccsReady && hizReady && ccsPSReady && ggttOK && observed && ok && gucOK && dmaWriteOK && hostOK && scratchOK && blitInitOK && tglMMIOUCReady && copyOK && auxAlignOK && iosCCSOK && ffModeOK && cpsOK && flushOK && tlbPreparserOK && semaphoreTLBOK && hangOK && recoveryOK && completionCacheOK && contextCacheOK;
 			// r201: resource/copy diagnostics are absent, not admission requirements.
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLResourceDiagnosticsRemoved",true);
