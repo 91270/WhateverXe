@@ -62,15 +62,29 @@ int main() {
  for(auto id:{0x9a40U,0x9a49U,0x9a78U,0x9a59U,0x9ac0U,0x9ac9U,0x9ad9U,0x9af8U})
  for(auto rev:{0U,1U,2U,3U,4U,255U})for(auto video:{0xe00feU,0xe00faU}) {
   check(id,rev,7,0xc0,video); // 48 EU, three DSS, six banks
-  check(id,rev,0x3e,0,video); // 80 EU, five DSS, eight banks
+  check(id,rev,0x1f,0x88,video); // 80 EU, five DSS, six banks (i5-1135G7)
   check(id,rev,0x3f,0,video); // 96 EU, six DSS, eight banks
  }
  XELP::GTResources resource;
  assert(!XELP::decodeTGLGT2(nullptr,resource));
+ const uint32_t i5_1135g7Fuses[]={0x1,0x1f,0,0x88,0xe00fa};
+ assert(XELP::decodeTGLGT2(i5_1135g7Fuses,resource));
+ assert(resource.slices==1 && resource.dss==5 && resource.nativeSubslices==10 &&
+        resource.eus==80 && resource.l3Banks==6 && resource.urbKiB==384);
+ const uint32_t invalid80Eu8Bank[]={0x1,0x1f,0,0,0xe00fa};
+ assert(!XELP::decodeTGLGT2(invalid80Eu8Bank,resource));
+ const uint32_t invalid96Eu6Bank[]={0x1,0x3f,0,0x88,0xe00fa};
+ assert(!XELP::decodeTGLGT2(invalid96Eu6Bank,resource));
  for(unsigned slice=0;slice<4;++slice)for(unsigned dss=0;dss<64;++dss)
- for(unsigned eu:{0U,0xc0U,0xf0U,0xffU})for(unsigned banks:{0U,0xc0U,0xf0U,0xffU}) {
-  uint32_t f[]={slice,dss,eu,banks,0xe00fa};unsigned count=__builtin_popcount(dss);
-  bool expected=slice==1 && eu==0 && ((count==3 && banks==0xc0) || ((count==5 || count==6) && banks==0));
+ for(unsigned eu:{0U,0xc0U,0xf0U,0xffU})
+ for(unsigned banks:{0U,0x88U,0xc0U,0xf0U,0xffU}) {
+  uint32_t f[]={slice,dss,eu,banks,0xe00fa};
+  unsigned count=__builtin_popcount(dss);
+  unsigned l3Banks=8-__builtin_popcount(banks);
+  bool expected=slice==1 && eu==0 &&
+      ((count==3 && l3Banks==6) ||
+       (count==5 && l3Banks==6) ||
+       (count==6 && l3Banks==8));
   assert(XELP::decodeTGLGT2(f,resource)==expected);
  }
  for(unsigned i=0;i<5;++i){uint32_t f[]={1,63,0,0,0xe00fa};f[i]=~0U;assert(!XELP::decodeTGLGT2(f,resource));}
