@@ -29,10 +29,18 @@ static void checkOnlyOneWordChanged(Batch a) {
     const auto original = a;
     assert(matches(a.data(), a.size()));
     assert(patch(a.data(), a.size()));
-    for (unsigned i = 0; i < a.size(); ++i)
-        assert(a[i] == (i == StallFlags ? RevisedStallFlags : original[i]));
+    for (unsigned i = 0; i < a.size(); ++i) {
+        uint32_t expected = original[i];
+        if (i == StallFlags) expected = RevisedStallFlags;
+        if (i == InvalidateCommand) expected = RevisedInvalidateCommand;
+        if (i == InvalidateFlags) expected = RevisedInvalidateFlags;
+        assert(a[i] == expected);
+    }
     assert(a[0x10/4] == NativeStallFlags); // First unrelated stall is unchanged.
-    assert(a[InvalidateFlags] == 0x89CU);
+    assert(a[InvalidateCommand] == 0x7A000204U);
+    assert(a[InvalidateFlags] == 0x00000894U);
+    assert(NativeInvalidatePair == 0x0000089C7A000004ULL);
+    assert(RevisedInvalidatePair == 0x000008947A000204ULL);
     assert(!patch(a.data(), a.size())); // Idempotent; do not double-write.
 }
 int main(int argc, char **argv) {

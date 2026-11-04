@@ -328,10 +328,10 @@ void XE::wrapTGLRecovery(void *channel) {
 }
 
 namespace {
-uint64_t tglPCWAStats[4] {}; // submissions, candidates, patched, concurrent changes
+uint64_t tglPCWAStats[6] {}; // submit, match, stall patched, stalled CAS miss, HDC patched, HDC CAS miss
 bool tglPCWASerialize(void *,void *,OSSerialize *serializer) {
-    uint64_t values[5] {1409226450};
-    for (unsigned i=0;i<4;++i)
+    uint64_t values[7] {1409226450};
+    for (unsigned i=0;i<6;++i)
         values[i+1]=__atomic_load_n(tglPCWAStats+i,__ATOMIC_RELAXED);
     auto data=OSData::withBytes(values,sizeof(values));
     if(!data)return false;
@@ -3850,7 +3850,7 @@ void XE::wrapTGLPipeControlSubmit(void *channel,void *descriptor) {
         if(tglVM.nofault(info+0x20,reinterpret_cast<uintptr_t>(&cpu),sizeof(cpu))==sizeof(cpu) &&
            tglVM.nofault(info+0x30,reinterpret_cast<uintptr_t>(&dwords),sizeof(dwords))==sizeof(dwords) &&
            dwords==TGLPipeControlWA::BatchDwords &&
-           (cpu>>47)==0x1FFFF && !(cpu&3) &&
+           (cpu>>47)==0x1FFFF && !(cpu&7) &&
            cpu<=UINT64_MAX-TGLPipeControlWA::BatchDwords*sizeof(uint32_t)) {
             uint32_t sample[TGLPipeControlWA::BatchDwords] {};
             if(tglVM.nofault(cpu,reinterpret_cast<uintptr_t>(sample),sizeof(sample))==sizeof(sample) &&
@@ -3860,9 +3860,21 @@ void XE::wrapTGLPipeControlSubmit(void *channel,void *descriptor) {
                     TGLPipeControlWA::StallFlags;
                 uint32_t native=TGLPipeControlWA::NativeStallFlags;
                 if(__atomic_compare_exchange_n(word,&native,TGLPipeControlWA::RevisedStallFlags,
-                                               false,__ATOMIC_RELEASE,__ATOMIC_RELAXED))
+                                               false,__ATOMIC_RELEASE,__ATOMIC_RELAXED)) {
                     __atomic_fetch_add(tglPCWAStats+2,1ULL,__ATOMIC_RELAXED);
-                else
+                    // The 8-byte pair is naturally aligned in the captured
+                    // page-backed command pool; CAS preserves a coherent
+                    // PIPE_CONTROL header + DW1 in one atomic operation.
+                    auto invalidate=reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(cpu)+
+                        TGLPipeControlWA::InvalidateCommand*sizeof(uint32_t));
+                    uint64_t original=TGLPipeControlWA::NativeInvalidatePair;
+                    if(__atomic_compare_exchange_n(invalidate,&original,
+                                                   TGLPipeControlWA::RevisedInvalidatePair,
+                                                   false,__ATOMIC_RELEASE,__ATOMIC_RELAXED))
+                        __atomic_fetch_add(tglPCWAStats+4,1ULL,__ATOMIC_RELAXED);
+                    else
+                        __atomic_fetch_add(tglPCWAStats+5,1ULL,__ATOMIC_RELAXED);
+                } else
                     __atomic_fetch_add(tglPCWAStats+3,1ULL,__ATOMIC_RELAXED);
             }
         }
@@ -11974,7 +11986,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);
-            // Gen12 WA 1409226450 trial, restricted to the exact 82GM B0
+            // Gen12 1409226450 + TGL Vol14 cache-invalidate trial, exact 82GM B0
             // board, Sequoia donor and witnessed 216-byte command template.
             // Opt-in only; no writable user binary or global flush changes.
             const bool pcWARequested=!adlnDetected &&
