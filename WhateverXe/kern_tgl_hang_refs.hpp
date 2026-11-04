@@ -72,12 +72,22 @@ void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t b
  };
  uint64_t calls[MaxCalls]={},programs[4]={},vertices[64]={};
  uint32_t strides[64]={};unsigned nc=0;
+ uint32_t mediaIDOffset=0,mediaIDLength=0;
  bool haveBT=false,haveSampler=false;uint32_t ibBytes=0;int32_t baseVertex=0;
  for (unsigned o=anchor;o<end;) {
   const uint8_t *p=batch+o;const uint32_t w=word(p);unsigned dw=length(w);
   if (!dw || dw>(n-o)/4) {c.q[8]=3;return;}
   if ((w==0x18B00101 || w==0x18C00001) && dw==3) {
    if(nc<MaxCalls) calls[nc++]=pair(p+4)&~3ULL;else c.q[23]++;
+  }
+  // Gen12 MEDIA_INTERFACE_DESCRIPTOR_LOAD: DW2 length in bytes, DW3 offset
+  // relative to STATE_BASE_ADDRESS.DynamicStateBaseAddress. Capture the
+  // descriptor and the referenced shader pages after confirming PPGTT owner.
+  if (w==0x70020002 && dw==4) {
+   const uint32_t bytes=word(p+8),offset=word(p+12);
+   if (bytes>=32 && bytes<=256 && !(bytes&31) && !(offset&63) && offset<0x1000000) {
+    mediaIDOffset=offset;mediaIDLength=bytes;
+   }
   }
   if ((w>>16)==0x782A && dw==2) {c.q[12]=word(p+4)&~31U;haveBT=true;}
   if ((w>>16)==0x782F && dw==2) {c.q[13]=word(p+4)&~31U;haveSampler=true;}
@@ -103,6 +113,28 @@ void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t b
  c.q[25]=static_cast<uint32_t>(baseVertex);c.q[26]=ibBytes;c.q[27]=nc;
  // Capture external batches first; absent pages remain explicit holes.
  for (unsigned i=0;i<nc;++i) span(calls[i],256,Batch);
+ // Only the observed 16-DW MEDIA SBA and real interface descriptor can
+ // authorize following a shader pointer. The descriptor page is first read
+ // through the same owner-qualified PPGTT as every other captured page.
+ if (mediaIDLength && c.q[10] && c.q[11]) {
+  const uint64_t descriptor=address(c.q[10],mediaIDOffset);
+  if (descriptor) {
+   c.q[29]=descriptor;c.q[30]=mediaIDLength/32;
+   span(descriptor,mediaIDLength,Table);
+   for(unsigned i=0;i<c.q[30];++i) {
+    const uint64_t at=descriptor+i*32;
+    auto *pd=add(at,Table);
+    if (!pd || !pd->q[3] || (at&4095)>4096-32) continue;
+    const uint8_t *idd=pd->bytes+(at&4095);
+    // KernelStartPointer low bits [31:6], with the high extension in DW1.
+    // Refuse an unknown >4GB instruction offset; never follow arbitrary data.
+    const uint32_t lo=word(idd),hi=word(idd+4);
+    if ((lo&63) || (hi&0xffff) || (lo&~63U)>=0x1000000U) continue;
+    const uint64_t gpu=address(c.q[11],lo&~63U);
+    if (gpu) {if(!c.q[31])c.q[31]=gpu;span(gpu,512,Shader);}
+   }
+  }
+ }
  for (unsigned i=0;i<4;++i) if (programs[i]) span(address(c.q[11],programs[i]),512,Shader);
  if (haveSampler) span(address(c.q[10],c.q[13]),256,Sampler);
  if (c.q[14]&31) span(address(c.q[10],c.q[14]&~31ULL),static_cast<unsigned>(c.q[14]&31)*32,Constant);
