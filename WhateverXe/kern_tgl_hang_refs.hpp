@@ -1,5 +1,8 @@
 // Bounded failure-only reference capture. Candidate SBA interpretation only:
 // external calls are retained for offline validation, never silently ignored.
+// The Sequoia VideoToolbox RCS completion batch uses 16-DW SBA (0x6101000e)
+// and a second-level MI_BATCH_BUFFER_START (0x18c00001) at +0x9c.
+// Include both exact shapes; capture the referenced page without executing it.
 #ifndef kern_tgl_hang_refs_hpp
 #define kern_tgl_hang_refs_hpp
 #include <stdint.h>
@@ -44,10 +47,11 @@ template<class ReadPage>
 void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t bb,ReadPage read) {
  c.q[0]=131;c.q[3]=base;c.q[4]=bb;
  c.q[8]=1;
- if (n>16384 || n<88 || bb<base || bb-base>n-4 || ((bb-base)&3)) return;
+ if (n>16384 || n<64 || bb<base || bb-base>n-4 || ((bb-base)&3)) return;
  const unsigned end=static_cast<unsigned>(bb-base);unsigned anchor=n;
- for (unsigned o=0;o+88<=n && o<=end;o+=4)
-  if (word(batch+o)==0x61010014 && walkable(batch,n,o,end)) anchor=o;
+ for (unsigned o=0;o+64<=n && o<=end;o+=4)
+  if ((word(batch+o)==0x61010014 || word(batch+o)==0x6101000e) &&
+      walkable(batch,n,o,end)) anchor=o;
  if (anchor==n) return;
  c.q[5]=base+anchor;c.q[8]=0;
  const uint8_t *s=batch+anchor;
@@ -72,7 +76,9 @@ void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t b
  for (unsigned o=anchor;o<end;) {
   const uint8_t *p=batch+o;const uint32_t w=word(p);unsigned dw=length(w);
   if (!dw || dw>(n-o)/4) {c.q[8]=3;return;}
-  if (w==0x18B00101 && dw==3) {if(nc<MaxCalls) calls[nc++]=pair(p+4)&~3ULL;else c.q[23]++;}
+  if ((w==0x18B00101 || w==0x18C00001) && dw==3) {
+   if(nc<MaxCalls) calls[nc++]=pair(p+4)&~3ULL;else c.q[23]++;
+  }
   if ((w>>16)==0x782A && dw==2) {c.q[12]=word(p+4)&~31U;haveBT=true;}
   if ((w>>16)==0x782F && dw==2) {c.q[13]=word(p+4)&~31U;haveSampler=true;}
   if ((w>>16)==0x7810 && dw==9) programs[0]=pair(p+4)&~63ULL;
