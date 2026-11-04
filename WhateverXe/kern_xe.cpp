@@ -79,6 +79,7 @@
 #include "kern_tgl_submit_history.hpp"
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
+#include "kern_tgl_recovery_gate.hpp"
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -11897,9 +11898,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// The same donor caller also stalls the accelerator resource lock on
 			// this Tahoe kernel. Keep the OS-family and exact donor guards: only the
 			// recovery caller changes; native reset/replay still owns completion.
-			const bool recoveryRequested=checkKernelArgument("-disablegfxfirmware") &&
-				((XELP::kernelOS(version)==XELP::OS::BigSur) ||
-				 (XELP::kernelOS(version)==XELP::OS::Tahoe));
+			// Experimental Sequoia caller contract: explicit opt-in only.
+			// Preserve the existing Big Sur/Tahoe behavior and exact donor ABI checks.
+			const bool recoveryRequested=TGLRecoveryGate::requested(
+				XELP::kernelOS(version),checkKernelArgument("-disablegfxfirmware"),
+				checkKernelArgument("-wex-tgl-recovery-sequoia"));
 			bool recoveryOK=!recoveryRequested;
 			if (recoveryRequested) {
 				const char *recovery="__ZN18IGAccelFIFOChannel22resetHardwareAndReplayEv";
