@@ -15251,8 +15251,8 @@ static bool tglS0SleepHookRouted {};
 static uint32_t tglS0WakeTrace[6][13] {};
 static uint32_t tglS0WakeCount {};
 
-static uint64_t tglS0WrapWillSleep(void *accelerator) {
- const auto result=reinterpret_cast<uint64_t (*)(void *)>(tglS0OrgWillSleep)(accelerator);
+static void tglS0WrapWillSleep(void *accelerator) {
+ reinterpret_cast<void (*)(void *)>(tglS0OrgWillSleep)(accelerator);
  const uint32_t epoch=__sync_add_and_fetch(&tglS0Epoch,1);
  for (unsigned i=0;i<arrsize(tglS0Sleep);++i) {
   auto &record=tglS0Sleep[i];auto &engine=tglCSBEngines[i];
@@ -15274,7 +15274,6 @@ static uint64_t tglS0WrapWillSleep(void *accelerator) {
    record.slots[j]=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8);
   __atomic_store_n(&record.epoch,epoch,__ATOMIC_RELEASE);
  }
- return result;
 }
 
 // Expose a fixed CPU-only receipt through a lazy IORegistry serializer, without
