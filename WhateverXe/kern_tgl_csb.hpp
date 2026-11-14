@@ -10,6 +10,31 @@ constexpr uint32_t Capacity = 12;
 constexpr uint32_t ResetIndex = Capacity - 1;
 constexpr uint64_t Sentinel = UINT64_MAX;
 
+// The hardware write pointer is separate from the driver's consumed head.
+ // A wake can preserve the CSB only when the idle tail and software head are
+ // unchanged from the observed pre-sleep state. No queue entries are dropped.
+enum class WakeAction : uint8_t { Initialize, Preserve, RearmAndInitialize };
+struct WakeBaseline {
+    uint32_t pointer {}, tail {}, head {}, active {};
+    bool valid {};
+};
+inline WakeAction classifyWake(const WakeBaseline &prior, uint32_t pointer,
+                               uint32_t hwsTail, uint32_t mode,
+                               uint32_t softwareHead, uint32_t active) {
+    if (mode == UINT32_MAX || pointer == UINT32_MAX)
+        return WakeAction::Initialize;
+    if (!(mode & 8))
+        return WakeAction::RearmAndInitialize;
+    const uint32_t write = pointer & 0xF;
+    if (!prior.valid || write >= Capacity || hwsTail >= Capacity ||
+        softwareHead >= Capacity || pointer != prior.pointer ||
+        write != prior.tail || write != hwsTail ||
+        write != softwareHead || softwareHead != prior.head ||
+        active != prior.active)
+        return WakeAction::Initialize;
+    return WakeAction::Preserve;
+}
+
 // Mask only the Gen11+ read/write fields defined in intel_lrc_reg.h.
 // r92's broad 0xffff mask also cleared bits15:12 (observed 7 -> 0),
 // after which HWSP and indexed-MMIO events appeared one slot apart.

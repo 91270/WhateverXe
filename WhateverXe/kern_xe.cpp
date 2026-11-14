@@ -15234,6 +15234,61 @@ struct TGLCSBIO {
  }
 };
 
+
+// S0 wake experiment. Take an immutable pre-sleep snapshot *after* the
+// accelerator's native sleep preparation. The wake decision is opt-in and
+// rejects a missing snapshot or any changed software context ownership.
+struct TGLS0SleepRecord {
+ TGLCSB::WakeBaseline before {};
+ uintptr_t slots[4] {};
+ void *streamer {};
+ uint32_t epoch {};
+};
+static TGLS0SleepRecord tglS0Sleep[6];
+static uint32_t tglS0Epoch {};
+static mach_vm_address_t tglS0OrgWillSleep {};
+static bool tglS0SleepHookRouted {};
+static uint32_t tglS0WakeTrace[6][13] {};
+static uint32_t tglS0WakeCount {};
+
+static uint64_t tglS0WrapWillSleep(void *accelerator) {
+ const auto result=reinterpret_cast<uint64_t (*)(void *)>(tglS0OrgWillSleep)(accelerator);
+ const uint32_t epoch=__sync_add_and_fetch(&tglS0Epoch,1);
+ for (unsigned i=0;i<arrsize(tglS0Sleep);++i) {
+  auto &record=tglS0Sleep[i];auto &engine=tglCSBEngines[i];
+  __atomic_store_n(&record.epoch,0U,__ATOMIC_RELEASE);
+  record.before.valid=false;
+  record.streamer=engine.streamer;
+  if (!engine.streamer || !engine.hardwareReady ||
+      engine.state.error!=TGLCSB::Error::None)continue;
+  TGLCSBIO io(engine.streamer,0);io.acquire();
+  const auto pointer=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
+  const auto tail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+  const auto mode=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+  const auto head=engine.state.head;
+  const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const auto idle=pointer!=UINT32_MAX && mode!=UINT32_MAX && (mode&8) &&
+     head<TGLCSB::Capacity && tail==head && (pointer&0xF)==head && active<=1;
+  record.before={pointer,tail,head,active,idle};
+  for (unsigned j=0;j<4;++j)
+   record.slots[j]=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8);
+  __atomic_store_n(&record.epoch,epoch,__ATOMIC_RELEASE);
+ }
+ return result;
+}
+
+// Expose a fixed CPU-only receipt through a lazy IORegistry serializer, without
+// allocating objects or updating registry properties from the sleep/wake path.
+static bool tglS0WakeTraceSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[4+6*13] {1,tglS0Epoch,tglS0WakeCount,tglS0SleepHookRouted};
+ for(unsigned i=0;i<6;++i)
+  for(unsigned j=0;j<13;++j)
+   out[4+i*13+j]=__atomic_load_n(&tglS0WakeTrace[i][j],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));
+ if(!data)return false;
+ const bool success=data->serialize(serializer);data->release();return success;
+}
+
 void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
  // Called before the first submission, wake reset, or GPU-reset replay. Never
@@ -15346,6 +15401,24 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
  }
+ if (ok && checkKernelArgument("-wex-tgl-s0-csb-resync")) {
+  // Both path and address are qualified against the analyzed donor build.
+  const auto symbol="__ZN16IntelAccelerator15systemWillSleepEv";
+  const auto target=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+  bool sleepOK=target==address+0x28916;
+  patcher.clearError();
+  if(sleepOK) {
+   KernelPatcher::RouteRequest route {symbol,tglS0WrapWillSleep,tglS0OrgWillSleep};
+   sleepOK=patcher.routeMultiple(index,&route,1,address,size);
+   patcher.clearError();
+  }
+  tglS0SleepHookRouted=sleepOK;
+  root->setProperty("TGLS0SleepHookRouted",sleepOK);
+  if(sleepOK) {
+   auto trace=OSSerializer::forTarget(nullptr,tglS0WakeTraceSerialize);
+   if(trace) {root->setProperty("TGLS0WakeTrace",trace);trace->release();}
+  }
+ }
  tglCSB12Enabled=ok;patcher.clearError();return ok;
 }
 
@@ -15364,7 +15437,60 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  }
  return ok;
 }
-void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+void XE::wrapTGLCSBWake(void *streamer) {
+ // Default behavior stays identical to 0.8.2. Do not invoke the native
+ // six-entry reset (pointer 7) in the patched twelve-entry scheduler.
+ if (!checkKernelArgument("-wex-tgl-s0-csb-resync") || !tglS0SleepHookRouted) {
+  tglCSBInitialize(streamer);
+  return;
+ }
+ bool preserve=false;
+ {
+  TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  auto &snap=tglS0Sleep[io.engine];
+  const uint32_t epoch=__atomic_load_n(&snap.epoch,__ATOMIC_ACQUIRE);
+  io.acquire();
+  const uint32_t pointer=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
+  const uint32_t tail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+  const uint32_t mode=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+  const uint32_t active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const auto before=(epoch && snap.streamer==streamer &&
+      e.hardwareReady && e.state.error==TGLCSB::Error::None)
+      ? snap.before : TGLCSB::WakeBaseline {};
+  auto action=TGLCSB::classifyWake(before,pointer,tail,mode,e.state.head,active);
+  if (action==TGLCSB::WakeAction::Preserve) {
+   for (unsigned j=0;j<4;++j)
+    if (snap.slots[j]!=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8)) {
+     action=TGLCSB::WakeAction::Initialize;break;
+    }
+  }
+  uint32_t modeAfter=mode;
+  if (action==TGLCSB::WakeAction::RearmAndInitialize && before.valid) {
+   // Native initModeRegisters programs this masked GFX_MODE write on boot.
+   // Restore it only if a previously running 12-entry GT lost the mode.
+   auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+   *reg=0x00080008U;
+   modeAfter=*reg;
+  }
+  if (action==TGLCSB::WakeAction::Preserve) {
+   // Only a drained, unchanged hardware CSB is preserved.
+   e.state.head=pointer&0xF;
+   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=e.state.head;
+   e.modeAtInit=modeAfter;
+   preserve=true;
+  }
+  const uint32_t data[] {epoch,snap.before.pointer,snap.before.tail,
+   snap.before.head,snap.before.active,before.valid?1U:0U,
+   pointer,tail,mode,static_cast<uint32_t>(action),modeAfter,
+   active,e.state.head};
+  for (unsigned j=0;j<13;++j)
+   __atomic_store_n(&tglS0WakeTrace[io.engine][j],data[j],__ATOMIC_RELAXED);
+  __sync_fetch_and_add(&tglS0WakeCount,1);
+  // A subsequent reset must not reuse an earlier sleep snapshot.
+  __atomic_store_n(&snap.epoch,0U,__ATOMIC_RELEASE);
+ }
+ if (!preserve) tglCSBInitialize(streamer);
+}
 void XE::wrapTGLCSBReset(void *streamer) {
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);

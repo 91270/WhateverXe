@@ -55,6 +55,22 @@ static void fresh(State &state, IO &io) {
 	io.writes = 0;
 }
 
+static void wakeTests() {
+    const WakeBaseline before{0x00000909, 9, 9, 1, true};
+    // The MMIO read pointer is not necessarily the software consumed head;
+    // a retained, fully-drained write pointer is the meaningful check.
+    assert(classifyWake(before, 0x00000909, 9, 0x8, 9, 1) == WakeAction::Preserve);
+    assert(classifyWake(before, 0x00000809, 9, 0x8, 9, 1) == WakeAction::Initialize);
+    assert(classifyWake(before, 0x0000090A, 10, 0x8, 9, 1) == WakeAction::Initialize);
+    assert(classifyWake(before, 0x00000909, 8, 0x8, 9, 1) == WakeAction::Initialize);
+    assert(classifyWake(before, 0x00000909, 9, 0x8, 8, 1) == WakeAction::Initialize);
+    assert(classifyWake(before, 0x00000909, 9, 0x8, 9, 0) == WakeAction::Initialize);
+    assert(classifyWake({0, 0, 0, 0, false}, 0, 0, 0x8, 0, 0) == WakeAction::Initialize);
+    assert(classifyWake(before, 0x00000909, 9, 0x0, 9, 1) == WakeAction::RearmAndInitialize);
+    assert(classifyWake(before, UINT32_MAX, 9, 0x0, 9, 1) == WakeAction::Initialize);
+    assert(classifyWake(before, 0x00000909, 9, UINT32_MAX, 9, 1) == WakeAction::Initialize);
+}
+
 static void eventTests() {
 	const unsigned idle = 0x7FF;
 	auto check = [](unsigned away, unsigned to, bool newQueue, unsigned detail,
@@ -123,6 +139,7 @@ int main(int argc, char **argv) {
 		printf("%08x:%08x\n", entry.identity, entry.flags);
 		return 0;
 	}
+	wakeTests();
 	eventTests();
 	// Model masked-register semantics, including r89's observed 0x7007.
 	// Only documented read/write fields may change. This does not model GPU
