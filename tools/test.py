@@ -38,7 +38,7 @@ display13_retirement display13_trial_retirement display13_port_wait display13_ag
 display13_boot_handoff display13_clock_runtime display13_training_frontend framebuffer_donor_runtime compat_bundle_version dsi_backlight_adapter
 dsi_restart dsi_panel dsi_command_adapter dsi_irq_live dsi_surface_adapter dsi_aperture_adapter
 display13_shutdown display13_wake_notifications released_physical_admission released_topology
-accelerator_resources display13_power_dispatch tgl_recovery test_runner_contract
+accelerator_resources display13_power_dispatch tgl_recovery test_runner_contract tgl_csb_wake_path
 """.split()
 FAMILIES = {'BigSur':'bigsur', 'Monterey':'monterey', 'Ventura':'ventura',
             'Sonoma':'sonoma', 'Sequoia':'sequoia', 'Tahoe':'tahoe'}
@@ -54,7 +54,8 @@ adls_donor adls_clock_native""".split()
 ACCELERATOR_TESTS = """tgl_ccs tgl_completion_cache tgl_cps_color_pipe tgl_ff_dop
 tgl_ff_mode tgl_object_preemption tgl_object_selector tgl_render_flush
 dsi_backing_adapter dsi_backing_native tgl_rpcs_native small_gt_urb
-tgl_tlb_preparser tgl_semaphore_tlb tgl_iosurface_compression tgl_gt2_urb""".split()
+tgl_tlb_preparser tgl_semaphore_tlb tgl_iosurface_compression tgl_gt2_urb
+tgl_native_sleep_abi""".split()
 
 @dataclass
 class Job:
@@ -78,7 +79,7 @@ def make_jobs(args, root, output):
                          '-fno-omit-frame-pointer','-I'+str(root/'WhateverXe'),str(source),'-o',str(exe)]),
             ('execute', [str(exe)])]))
     for name in PYTHON_TESTS:
-        kind = 'source-lint' if name == 'xelp_forcewake_irq' else 'cpu'
+        kind = 'source-lint' if name in {'xelp_forcewake_irq','tgl_csb_wake_path'} else 'cpu'
         jobs.append(Job(name, kind, [('script', [sys.executable,str(root/'tests'/(name+'.py'))])]))
     for name in DONOR_TESTS:
         command = [sys.executable,str(root/'tests'/(name+'.py'))]

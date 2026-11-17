@@ -30,6 +30,7 @@
 #include "kern_vbt.hpp"
 #include "kern_alderlake_s.hpp"
 #include "kern_xelp_panel_pwm.hpp"
+#include "kern_tgl_display_wake_pwm.hpp"
 #include "kern_xelp_donor.hpp"
 #include "kern_xelp_display_contract.hpp"
 #include "kern_xelp_link_requirements.hpp"
@@ -122,6 +123,16 @@ private:
     bool adlsPLLTableReady {},adlsClockReady {},adlsPowerReady {},adlsPanelPWMReady {};
  XELP::PanelPWM adlsPanelPWM;
  mach_vm_address_t orgADLSLightUpEDP {},orgADLSPanelBacklight {};
+ // Opt-in TGL-only display-doze wake PWM repair, independent of CSB/system sleep.
+ bool tglDisplayWakePWMRouteReady {};
+ // Valid only for one native framebuffer display Doze epoch; never system sleep.
+ struct TGLDisplayWakeLevel {
+  IOService *framebuffer {};void *controller {};
+  uint32_t period {},duty {};bool valid {};
+ } tglDisplayWakeLevel;
+ mach_vm_address_t orgTGLDisplayWakePWM {};
+ static uint32_t wrapTGLDisplayWakePWM(IOService *framebuffer,uint32_t requested);
+
  static bool adlsPanelPWMTarget(void *controller,void *&access,void *&power);
  static bool adlsCapturePanelPWM(void *controller);
  static uint32_t wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void *timing);
@@ -696,6 +707,9 @@ private:
 	mach_vm_address_t tglEnablePG {}, tglDisablePG {}, tglPortByDDI {};
 	mach_vm_address_t orgTGLEnableAUXPower {}, orgTGLDisableAUXPower {};
 	bool tglAUXParentReady {false};
+	// Read-only experimental native AUX/DDI reference receipts on DDI0.
+	// This never changes donor reference counts or touches MMIO.
+	bool tglEDPRefDiagRequested {false};
 	void *tglAUXParentOwner {};
 	// Qualified PHY backends only; immutable while AUX references are live.
 	// Explicit fixed-DP wiring selects the common TC1..6 backend.

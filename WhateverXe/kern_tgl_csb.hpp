@@ -11,28 +11,64 @@ constexpr uint32_t ResetIndex = Capacity - 1;
 constexpr uint64_t Sentinel = UINT64_MAX;
 
 // The hardware write pointer is separate from the driver's consumed head.
- // A wake can preserve the CSB only when the idle tail and software head are
- // unchanged from the observed pre-sleep state. No queue entries are dropped.
+// A wake can preserve the CSB only when the idle tail and software head are
+// unchanged from the observed pre-sleep state. No queue entries are dropped.
 enum class WakeAction : uint8_t { Initialize, Preserve, RearmAndInitialize };
 struct WakeBaseline {
     uint32_t pointer {}, tail {}, head {}, active {};
     bool valid {};
 };
-inline WakeAction classifyWake(const WakeBaseline &prior, uint32_t pointer,
-                               uint32_t hwsTail, uint32_t mode,
-                               uint32_t softwareHead, uint32_t active) {
-    if (mode == UINT32_MAX || pointer == UINT32_MAX)
-        return WakeAction::Initialize;
-    if (!(mode & 8))
-        return WakeAction::RearmAndInitialize;
+struct WakePlan {
+    WakeAction action {WakeAction::Initialize};
+    bool restoreMode {};
+};
+constexpr bool hasCSB12Mode(uint32_t mode) {
+    return mode != UINT32_MAX && (mode & 8);
+}
+constexpr WakePlan planMode(uint32_t mode, uint32_t modeAtInit) {
+    if (mode == UINT32_MAX || hasCSB12Mode(mode))
+        return {WakeAction::Initialize, false};
+    return {WakeAction::RearmAndInitialize, hasCSB12Mode(modeAtInit)};
+}
+inline WakePlan planWake(const WakeBaseline &prior, uint32_t pointer,
+                         uint32_t tail, uint32_t mode,
+                         uint32_t softwareHead, uint32_t active,
+                         uint32_t modeAtInit) {
+    const auto modePlan=planMode(mode,modeAtInit);
+    if (modePlan.action==WakeAction::RearmAndInitialize ||
+        mode==UINT32_MAX)
+        return modePlan;
+    if (pointer == UINT32_MAX)
+        return {WakeAction::Initialize, false};
     const uint32_t write = pointer & 0xF;
-    if (!prior.valid || write >= Capacity || hwsTail >= Capacity ||
+    if (!prior.valid || write >= Capacity || tail >= Capacity ||
         softwareHead >= Capacity || pointer != prior.pointer ||
-        write != prior.tail || write != hwsTail ||
+        write != prior.tail || write != tail ||
         write != softwareHead || softwareHead != prior.head ||
         active != prior.active)
-        return WakeAction::Initialize;
-    return WakeAction::Preserve;
+        return {WakeAction::Initialize, false};
+    return {WakeAction::Preserve, false};
+}
+
+// Use the same tail source as the normal CSB drain. In MMIO-tail mode the
+// indexed write pointer is authoritative; HWSP+0xBC is not the live tail.
+template<class IO>
+uint32_t readTail(IO &io) {
+    if (!io.mmioTail)
+        return io.readHWSPLastWrite();
+    io.acquire();
+    return io.readMMIOPointer() & 0xF;
+}
+
+// GFX_MODE uses a masked write. Re-arm only when the last successful
+// initialization proved that bit 3 was enabled, then verify the readback.
+template<class IO>
+bool ensureCSB12Mode(const WakePlan &plan, IO &io, uint32_t &modeAfter) {
+    if (plan.restoreMode) {
+        io.writeMode(0x00080008U);
+        modeAfter = io.readMode();
+    }
+    return hasCSB12Mode(modeAfter);
 }
 
 // Mask only the Gen11+ read/write fields defined in intel_lrc_reg.h.

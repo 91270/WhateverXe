@@ -13038,6 +13038,26 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGRouteGammaWrites", routed);
 				patcher.clearError();
 			}
+            // Experimental Tiger Lake display-only Doze(1)->Wake(2) fix.
+            // An exact donor guard ensures we never wrap unknown FB state ABIs.
+            // Normal system Sleep/Wake and Display13 use their existing routes.
+            if (tglActive && xeProfile.family==XELP::Family::TigerLake &&
+                !display13FramebufferRequested &&
+                checkKernelArgument("-wex-tgl-displaywake-pwm")) {
+                const char *symbol="__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj";
+                const uint8_t entry[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,
+                    0x53,0x50,0x41,0x89,0xF6,0x49,0x89,0xFF,0x48,0xFF,0x05,0xF1};
+                const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+                const bool known=fn==address+0x24DE8 && size>0x24DE8+sizeof(entry) &&
+                    !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
+                patcher.clearError();
+                KernelPatcher::RouteRequest route(symbol,wrapTGLDisplayWakePWM,orgTGLDisplayWakePWM);
+                tglDisplayWakePWMRouteReady=known && orgTGLRegisterRead && orgTGLRegisterWrite &&
+                    patcher.routeMultiple(index,&route,1,address,size);
+                patcher.clearError();
+                IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayWakePWMRouteReady",tglDisplayWakePWMRouteReady);
+            }
+
 			{
 				tglStreamLock = IOSimpleLockAlloc();
 				tglProgramLock = IOSimpleLockAlloc();
@@ -13337,6 +13357,12 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 					tglAUXParentReady = patcher.routeMultiple(index, routes, arrsize(routes), address, size);
 				}
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGAUXParentPower", tglAUXParentReady);
+				// Separate explicit diagnostic. Existing AUX hooks are already
+				// installed for qualified TGL; no extra native route is needed.
+				tglEDPRefDiagRequested=tglAUXParentReady &&
+					XELP::displayAdapter(xeProfile.family)==XELP::DisplayAdapter::TGL &&
+					checkKernelArgument("-wex-tgl-edp-refdiag");
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPRefDiagReady",tglEDPRefDiagRequested);
 				patcher.clearError();
 			}
    // Resolve the base setter, never the HAL setter with fixed FIA writes.
@@ -14034,6 +14060,172 @@ void XE::wrapADLSPanelPWMEnable(void *access) {
   value|=s->adlsPanelPWM.polarity;
  }
  wrapTGLRegisterWrite(access,0xC8250,value);
+}
+
+// Display-only eDP resume does not necessarily execute LightUpEDP, which is
+// the native caller that writes BLC_PWM_CTL1=0x80000000. A successful
+// setFramebufferPowerState(2) can therefore leave PWM disabled after Doze.
+// This remains opt-in and is never used for the system Sleep(0) path.
+// Hardware registers are accessed only with an owned native PG1 reference.
+uint32_t XE::wrapTGLDisplayWakePWM(IOService *fb,uint32_t requested) {
+ auto s=callbackXE;
+ const auto b=reinterpret_cast<uint8_t *>(fb);
+ const bool enough=fb && fb->getMetaClass()->getClassSize()>=0x4B90;
+ const uint32_t prior=enough ? *reinterpret_cast<const uint32_t *>(b+0x4284) : UINT32_MAX;
+ // Capture the last ACTUAL visible PWM level before native Wake->Doze.
+ // The donor can zero both duty and its cached brightness during Doze;
+ // the post-wake callback must not guess a new brightness from zero.
+ if(requested==0)__atomic_store_n(&s->tglDisplayWakeLevel.valid,false,__ATOMIC_RELEASE);
+ if(prior==2 && requested==1) {
+  auto &last=s->tglDisplayWakeLevel;
+  // Do not discard the last observed positive native PWM write here:
+  // display fade may already have written duty=0 before entering Doze.
+  if(enough && s->tglActive && s->xeProfile.family==XELP::Family::TigerLake &&
+     s->tglDisplayWakePWMRouteReady && s->tglTCNativeFunctions.complete() &&
+     s->orgTGLRegisterRead && s->orgTGLRegisterWrite &&
+     s->tglObservationController && *reinterpret_cast<const uint32_t *>(b+0x1DC)==0) {
+   auto controller=static_cast<uint8_t *>(s->tglObservationController);
+   auto &f=s->tglTCNativeFunctions;
+   if(*reinterpret_cast<void **>(b+0x1D0)==controller &&
+      *f.controllerSlot==controller && !controller[0x918] &&
+      !*reinterpret_cast<void **>(controller+0xD0)) {
+    auto port=static_cast<uint8_t *>(f.portByDDI(0));
+    if(port && !port[0x117] && *reinterpret_cast<uint32_t *>(port+0x550)==1 &&
+       *reinterpret_cast<void **>(port+0x548) &&
+       **reinterpret_cast<uint32_t **>(port+0x548)==0) {
+     auto power=*reinterpret_cast<uint8_t **>(controller+0xC8);
+     auto access=*reinterpret_cast<uint8_t **>(controller+0xC40);
+     if(power && access && !power[0x18] &&
+        *reinterpret_cast<void **>(power+0x10)==controller &&
+        *reinterpret_cast<void **>(power+0x78)==access &&
+        *reinterpret_cast<void **>(port+0x578)==access &&
+        *reinterpret_cast<void **>(access+0x50) &&
+        *reinterpret_cast<uint32_t *>(access+0x60)>=0xC825CU) {
+      const auto read=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead);
+      f.getPG(power,1);
+      const auto wells=read(access,0x45404),fuse=read(access,0x42000);
+      if(TGLDisplayWakePWM::pg1Ready(wells,fuse)) {
+       const auto panel=read(access,0xC7200),ctl=read(access,0xC8250);
+       const auto period=read(access,0xC8254),duty=read(access,0xC8258);
+       if(panel!=UINT32_MAX && (panel&TGLDisplayWakePWM::PanelOn) &&
+          ctl!=UINT32_MAX && (ctl&TGLDisplayWakePWM::PWMEnable) &&
+          !(ctl&~(TGLDisplayWakePWM::PWMEnable|TGLDisplayWakePWM::PWMPolarity)) &&
+          period && period!=UINT32_MAX && duty && duty<=period) {
+        last.framebuffer=fb;last.controller=controller;
+        __atomic_store_n(&last.valid,false,__ATOMIC_RELEASE);
+        last.period=period;last.duty=duty;
+        __atomic_store_n(&last.valid,true,__ATOMIC_RELEASE);
+       }
+      }
+      f.putPG(power,1);
+     }
+    }
+   }
+  }
+  // The original FB state is still Wake here; report whether an earlier
+  // native-positive MMIO receipt survived (or a fresh pre-Doze read worked).
+  uint32_t dozeReceipt[] {1,prior,requested,
+   static_cast<uint32_t>(__atomic_load_n(&last.valid,__ATOMIC_ACQUIRE)),
+   last.period,last.duty};
+  IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayDozeCapture",
+                                                    dozeReceipt,sizeof(dozeReceipt));
+ }
+ const auto result=FunctionCast(wrapTGLDisplayWakePWM,s->orgTGLDisplayWakePWM)(fb,requested);
+ if(result || prior!=1 || requested!=2 || !enough || !s->tglActive ||
+    s->xeProfile.family!=XELP::Family::TigerLake || !s->tglDisplayWakePWMRouteReady ||
+    !s->tglTCNativeFunctions.complete() || !s->orgTGLRegisterRead ||
+    !s->orgTGLRegisterWrite || !s->tglObservationController ||
+    *reinterpret_cast<const uint32_t *>(b+0x4284)!=2 ||
+    *reinterpret_cast<const uint32_t *>(b+0x1DC)!=0)return result;
+ auto controller=static_cast<uint8_t *>(s->tglObservationController);
+ if(*reinterpret_cast<void **>(b+0x1D0)!=controller ||
+    *s->tglTCNativeFunctions.controllerSlot!=controller ||
+    controller[0x918] || *reinterpret_cast<void **>(controller+0xD0))return result;
+ auto port=static_cast<uint8_t *>(s->tglTCNativeFunctions.portByDDI(0));
+ if(!port || port[0x117] || *reinterpret_cast<uint32_t *>(port+0x550)!=1 ||
+    !*reinterpret_cast<void **>(port+0x548))return result;
+ auto cfg=*reinterpret_cast<const uint32_t **>(port+0x548);
+ if(cfg[0]!=0)return result;
+ auto power=*reinterpret_cast<uint8_t **>(controller+0xC8);
+ auto access=*reinterpret_cast<uint8_t **>(controller+0xC40);
+ if(!power || !access || power[0x18] ||
+    *reinterpret_cast<void **>(power+0x10)!=controller ||
+    *reinterpret_cast<void **>(power+0x78)!=access ||
+    *reinterpret_cast<void **>(port+0x578)!=access ||
+    !*reinterpret_cast<void **>(access+0x50) ||
+    *reinterpret_cast<uint32_t *>(access+0x60)<0xC825CU)return result;
+ const auto read=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead);
+ const auto write=FunctionCast(wrapTGLRegisterWrite,s->orgTGLRegisterWrite);
+ TGLDisplayWakePWM::Readout snap {};
+ snap.priorState=prior;snap.requestedState=requested;
+ snap.actualState=*reinterpret_cast<const uint32_t *>(b+0x4284);
+ snap.qualified=true;snap.independentPWM=true;
+ // The IOBacklightDisplay user request is independent of the donor's E58
+ // cache, which may have been zeroed by an asynchronous display fade.
+ // Read only the property under the IORegistry lock. No GPU MMIO here.
+ if(fb) {
+  auto paramsObject=fb->copyProperty("IODisplayParameters",gIOServicePlane,
+                                    kIORegistryIterateRecursively);
+  auto params=OSDynamicCast(OSDictionary,paramsObject);
+  auto brightness=params ? OSDynamicCast(OSDictionary,params->getObject("brightness")) : nullptr;
+  auto level=brightness ? OSDynamicCast(OSNumber,brightness->getObject("value")) : nullptr;
+  auto maximum=brightness ? OSDynamicCast(OSNumber,brightness->getObject("max")) : nullptr;
+  if(level && maximum) {
+   snap.requestedBrightness=level->unsigned32BitValue();
+   snap.maximumBrightness=maximum->unsigned32BitValue();
+  }
+  if(paramsObject)paramsObject->release();
+ }
+ auto &f=s->tglTCNativeFunctions;
+ f.getPG(power,1);
+ const auto wells=read(access,0x45404),fuse=read(access,0x42000);
+ // getPG(power,1) acquires PG1. 0x42000 bit 24 describes PG3,
+ // so requiring it can suppress a valid display-only recovery.
+ const bool ready=TGLDisplayWakePWM::pg1Ready(wells,fuse);
+ snap.powerReady=ready;
+ if(ready) {
+  snap.panelStatus=read(access,0xC7200);
+  snap.control=read(access,0xC8250);
+  snap.period=read(access,0xC8254);
+  snap.duty=read(access,0xC8258);
+  snap.nativeBrightness=*reinterpret_cast<const uint32_t *>(controller+0xE58);
+  const auto &last=s->tglDisplayWakeLevel;
+  if(__atomic_load_n(&last.valid,__ATOMIC_ACQUIRE) &&
+     last.framebuffer==fb && last.controller==controller &&
+     last.period==snap.period) snap.preDozeDuty=last.duty;
+ }
+ const bool should=TGLDisplayWakePWM::rearm(snap);
+ uint32_t after=snap.control;
+ uint32_t dutyAfter=snap.duty;
+ if(should && *reinterpret_cast<const uint32_t *>(b+0x4284)==2) {
+  // Reapply the exact native duty formula when Doze erased the duty MMIO.
+  // Do not rewrite the level if it is already nonzero.
+  if(TGLDisplayWakePWM::restoreDutyRequired(snap)) {
+   write(access,0xC8258,TGLDisplayWakePWM::restoredDuty(snap));
+   dutyAfter=read(access,0xC8258);
+  }
+  if(dutyAfter==TGLDisplayWakePWM::restoredDuty(snap) &&
+     !(snap.control&TGLDisplayWakePWM::PWMEnable)) {
+   // Only re-enable if disabled: when enabled with duty=0, write duty only.
+   write(access,0xC8250,TGLDisplayWakePWM::enabledControl(snap));
+   after=read(access,0xC8250);
+  }
+ }
+ f.putPG(power,1);
+ // Append the raw power receipts so a false readiness result is diagnosable.
+ // Keep pre-existing fields at fixed indices for older readers.
+ uint32_t record[] {5,prior,requested,snap.actualState,
+  snap.panelStatus,snap.control,after,snap.period,snap.duty,
+  static_cast<uint32_t>(ready),static_cast<uint32_t>(should),
+  static_cast<uint32_t>(should && (after&TGLDisplayWakePWM::PWMEnable) &&
+                        dutyAfter==TGLDisplayWakePWM::restoredDuty(snap)),
+  snap.nativeBrightness,dutyAfter,wells,fuse,
+  snap.preDozeDuty,static_cast<uint32_t>(s->tglDisplayWakeLevel.valid),
+  snap.requestedBrightness,snap.maximumBrightness};
+ IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayWakePWMRepair",record,sizeof(record));
+ // The same validated level remains eligible across display-only epochs,
+ // until overwritten by another positive native level or system sleep(0).
+ return result;
 }
 
 bool XE::wrapTGLPanelPowerProperty(IORegistryEntry *framebuffer, const char *, OSObject *value) {
@@ -15208,9 +15400,18 @@ struct TGLCSBIO {
  }
  ~TGLCSBIO() { if (awake) tglCSBForceWake[wakeVariant](owner,false,7); }
  void acquire() { if (!awake) {tglCSBForceWake[wakeVariant](owner,true,7);awake=true;} }
- uint32_t readTail() {
-  if (!mmioTail) return sampledTail=*reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
-  acquire();return sampledTail=*reinterpret_cast<volatile uint32_t *>(bar+pointerReg)&15;
+ uint32_t readHWSPLastWrite() {
+  return *reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
+ }
+ uint32_t readMMIOPointer() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+pointerReg);
+ }
+ uint32_t readTail() { return sampledTail=TGLCSB::readTail(*this); }
+ uint32_t readMode() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+modeReg);
+ }
+ void writeMode(uint32_t value) {
+  *reinterpret_cast<volatile uint32_t *>(bar+modeReg)=value;
  }
  void readFence() { __asm__ volatile("lfence" ::: "memory"); }
  uint64_t readEntry(uint32_t i) { return *reinterpret_cast<volatile uint64_t *>(hwsp+0x40+i*8); }
@@ -15262,9 +15463,9 @@ static void tglS0WrapWillSleep(void *accelerator) {
   if (!engine.streamer || !engine.hardwareReady ||
       engine.state.error!=TGLCSB::Error::None)continue;
   TGLCSBIO io(engine.streamer,0);io.acquire();
-  const auto pointer=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
-  const auto tail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
-  const auto mode=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+  const auto pointer=io.readMMIOPointer();
+  const auto tail=io.readTail();
+  const auto mode=io.readMode();
   const auto head=engine.state.head;
   const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
   const auto idle=pointer!=UINT32_MAX && mode!=UINT32_MAX && (mode&8) &&
@@ -15290,10 +15491,26 @@ static bool tglS0WakeTraceSerialize(void *,void *,OSSerialize *serializer) {
 
 void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ // Any CSB reinitialization invalidates the pre-sleep baseline. In particular,
+ // a GPU reset between systemWillSleep and resetOnWake must not reuse it.
+ __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
  // Called before the first submission, wake reset, or GPU-reset replay. Never
  // at reset's return: that method can submit GPU work before it returns.
- engine.streamer=streamer;TGLCSB::initialize(engine.state,io);
- engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ engine.streamer=streamer;engine.hardwareReady=false;
+ io.acquire();
+ uint32_t mode=io.readMode();
+ const auto modePlan=TGLCSB::planMode(mode,engine.modeAtInit);
+ if (!TGLCSB::ensureCSB12Mode(modePlan,io,mode)) {
+  // A later submit must not bypass the GFX_MODE guard by retrying initialization.
+  engine.state.error=TGLCSB::Error::Unavailable;
+  return;
+ }
+ TGLCSB::initialize(engine.state,io);
+ if (engine.state.error!=TGLCSB::Error::None) {
+  engine.hardwareReady=false;
+  return;
+ }
+ engine.modeAtInit=mode;
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
 }
@@ -15428,6 +15645,11 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
   // storage here, but defer forcewake/MMIO until the first submission or the
   // native wake-reset entry point, where that hardware access is established.
   TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  // Each native init starts a new CSB lifetime; never reuse the previous
+  // lifetime's GFX_MODE proof or sleep snapshot, even if the allocator reuses
+  // the same streamer address.
+  e.modeAtInit=UINT32_MAX;
+  __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
   e.streamer=streamer;e.hardwareReady=false;
   io.writeTail(TGLCSB::ResetIndex);
   for (unsigned i=0;i<TGLCSB::Capacity;++i) io.writeEntry(i,TGLCSB::Sentinel);
@@ -15437,41 +15659,41 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  return ok;
 }
 void XE::wrapTGLCSBWake(void *streamer) {
- // Default behavior stays identical to 0.8.2. Do not invoke the native
- // six-entry reset (pointer 7) in the patched twelve-entry scheduler.
+ // The default wake policy remains CSB reinitialization; snapshot-based
+ // preservation is opt-in. Never invoke the native six-entry reset (pointer 7).
  if (!checkKernelArgument("-wex-tgl-s0-csb-resync") || !tglS0SleepHookRouted) {
   tglCSBInitialize(streamer);
   return;
  }
- bool preserve=false;
+ bool preserve=false,modeReady=false;
  {
   TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
   auto &snap=tglS0Sleep[io.engine];
   const uint32_t epoch=__atomic_load_n(&snap.epoch,__ATOMIC_ACQUIRE);
   io.acquire();
-  const uint32_t pointer=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
-  const uint32_t tail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
-  const uint32_t mode=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+  const uint32_t pointer=io.readMMIOPointer();
+  const uint32_t tail=io.readTail();
+  const uint32_t mode=io.readMode();
   const uint32_t active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
   const auto before=(epoch && snap.streamer==streamer &&
       e.hardwareReady && e.state.error==TGLCSB::Error::None)
       ? snap.before : TGLCSB::WakeBaseline {};
-  auto action=TGLCSB::classifyWake(before,pointer,tail,mode,e.state.head,active);
-  if (action==TGLCSB::WakeAction::Preserve) {
+  const auto plan=TGLCSB::planWake(before,pointer,tail,mode,e.state.head,active,e.modeAtInit);
+  auto action=plan.action;
+  uint32_t modeAfter=mode;
+  modeReady=TGLCSB::ensureCSB12Mode(plan,io,modeAfter);
+  if (!modeReady) {
+   // Never initialize a 12-entry queue unless GFX_MODE bit 3 is confirmed.
+   e.state.error=TGLCSB::Error::Unavailable;
+   e.hardwareReady=false;
+  }
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
    for (unsigned j=0;j<4;++j)
     if (snap.slots[j]!=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8)) {
      action=TGLCSB::WakeAction::Initialize;break;
     }
   }
-  uint32_t modeAfter=mode;
-  if (action==TGLCSB::WakeAction::RearmAndInitialize && before.valid) {
-   // Native initModeRegisters programs this masked GFX_MODE write on boot.
-   // Restore it only if a previously running 12-entry GT lost the mode.
-   auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
-   *reg=0x00080008U;
-   modeAfter=*reg;
-  }
-  if (action==TGLCSB::WakeAction::Preserve) {
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
    // Only a drained, unchanged hardware CSB is preserved.
    e.state.head=pointer&0xF;
    *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=e.state.head;
@@ -15488,7 +15710,7 @@ void XE::wrapTGLCSBWake(void *streamer) {
   // A subsequent reset must not reuse an earlier sleep snapshot.
   __atomic_store_n(&snap.epoch,0U,__ATOMIC_RELEASE);
  }
- if (!preserve) tglCSBInitialize(streamer);
+ if (modeReady && !preserve) tglCSBInitialize(streamer);
 }
 void XE::wrapTGLCSBReset(void *streamer) {
  tglCSBInitialize(streamer);
@@ -17375,8 +17597,16 @@ void XE::wrapTGLEnableAUXPower(void *power, uint32_t ddi) {
 	if (self->tglAUXParentEligible(ddi) && !self->tglAUXParentOwner)
 		self->tglAUXParentOwner = power;
 	const bool hold = self->tglAUXParentEligible(ddi) && self->tglAUXParentOwner == power;
-	void *port = hold ? reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
+	const bool trace=self->tglEDPRefDiagRequested && ddi==0 && power && self->tglPortByDDI;
+	void *port = (hold || trace) && self->tglPortByDDI ?
+		reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
 	auto bytes = static_cast<uint8_t *>(power);
+	// Event 12: native AUX get entry/return, independent of parent-PG gate.
+	// a=native AUX refs, b=native DDI refs, header=extra PG refs, packet=suspend.
+	if(trace && port)tglAUXRecord(port,12,false,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) {
 		tglAUXRecord(port, 5, false, 0, *reinterpret_cast<uint32_t *>(bytes + 0x28), *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi), self->tglAUXParentRefs[ddi]);
 		reinterpret_cast<void (*)(void *, uint32_t)>(self->tglEnablePG)(power, self->tglAUXParentPG(ddi));
@@ -17385,13 +17615,19 @@ void XE::wrapTGLEnableAUXPower(void *power, uint32_t ddi) {
 		++self->tglAUXParentRefs[ddi];
 	}
 	FunctionCast(wrapTGLEnableAUXPower, self->orgTGLEnableAUXPower)(power, ddi);
+	if(trace && port)tglAUXRecord(port,12,true,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) tglAUXRecord(port, 5, true, 0, *reinterpret_cast<uint32_t *>(bytes + 0x28), *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi), self->tglAUXParentRefs[ddi]);
 }
 
 void XE::wrapTGLDisableAUXPower(void *power, uint32_t ddi) {
 	auto self = callbackXE;
 	const bool hold = self->tglAUXParentEligible(ddi);
-	void *port = hold ? reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
+	const bool trace=self->tglEDPRefDiagRequested && ddi==0 && power && self->tglPortByDDI;
+	void *port = (hold || trace) && self->tglPortByDDI ?
+		reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
 	auto bytes = static_cast<uint8_t *>(power);
 	// EFI refs have no matching extra PG ref. Consume those first, including
 	// when inherited and owned refs coexist. Keep our PG refs until the last
@@ -17399,8 +17635,16 @@ void XE::wrapTGLDisableAUXPower(void *power, uint32_t ddi) {
 	const auto nativeRefs = hold ? *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi) : 0;
 	const bool release = hold && self->tglAUXParentOwner == power && self->tglAUXParentRefs[ddi] != 0 &&
 		nativeRefs != 0 && nativeRefs <= self->tglAUXParentRefs[ddi];
+	if(trace && port)tglAUXRecord(port,13,false,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) tglAUXRecord(port, 6, false, 0, *reinterpret_cast<uint32_t *>(bytes + 0x28), *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi), self->tglAUXParentRefs[ddi]);
 	FunctionCast(wrapTGLDisableAUXPower, self->orgTGLDisableAUXPower)(power, ddi);
+	if(trace && port)tglAUXRecord(port,13,true,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) {
 		if (release) {
 			--self->tglAUXParentRefs[ddi];
@@ -19584,6 +19828,28 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
  const bool trace=tglTransitionRegister(reg);
  if(trace)tglTransitionRecord(36,false,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
 	FunctionCast(wrapTGLRegisterWrite, callbackXE->orgTGLRegisterWrite)(access, reg, value);
+ // Keep the independent native PWM control writes; after a failed wake,
+ // comparing these with duty receipts shows which write occurred last.
+ // The native caller owns the power gate; IORegistry never reads MMIO.
+ if(callbackXE->tglActive && callbackXE->tglDisplayWakePWMRouteReady &&
+    callbackXE->xeProfile.family==XELP::Family::TigerLake &&
+    reg==0xC8250 && callbackXE->orgTGLRegisterRead) {
+  auto ctl=static_cast<uint8_t *>(callbackXE->tglObservationController);
+  if(ctl && access && *reinterpret_cast<void **>(ctl+0xC40)==access) {
+   const auto read=FunctionCast(wrapTGLRegisterRead,callbackXE->orgTGLRegisterRead);
+   static uint32_t count;
+   const auto seq=__sync_add_and_fetch(&count,1);
+   auto fb=*reinterpret_cast<IOService **>(ctl+0xD60);
+   const bool fbid=fb && fb->getMetaClass()->getClassSize()>=0x4B90 &&
+      *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(fb)+0x1D0)==ctl;
+   uint32_t receipt[] {1,seq,value,read(access,0xC8250),
+    read(access,0xC8254),read(access,0xC8258),
+    fbid?*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284):UINT32_MAX,
+    *reinterpret_cast<uint32_t *>(ctl+0xE58)};
+   char key[32];snprintf(key,sizeof(key),"TGLPWMControl%u",seq%48U);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,receipt,sizeof(receipt));
+  }
+ }
  // Sample PWM only at a native duty write while its caller owns power.
  // IORegistry reads consume this receipt; they never touch live MMIO.
  if(callbackXE->tglActive && reg==0xC8258 && callbackXE->orgTGLRegisterRead) {
@@ -19594,6 +19860,37 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
    uint32_t receipt[]={1,__sync_add_and_fetch(&count,1),value,
     read(access,0xC8250),read(access,0xC8254),read(access,0xC8258)};
    IORegistryEntry::getRegistryRoot()->setProperty("TGLBacklightPWM",receipt,sizeof(receipt));
+   // The donor writes a POSITIVE duty under its native register lock.
+   // Remember this proven level while FB0 is awake, before a later display
+   // fade can zero both the PWM duty and controller+0xE58 cached brightness.
+   if(callbackXE->tglDisplayWakePWMRouteReady &&
+      callbackXE->xeProfile.family==XELP::Family::TigerLake) {
+    auto fb=*reinterpret_cast<IOService **>(ctl+0xD60);
+    const bool fbReady=fb && fb->getMetaClass()->getClassSize()>=0x4B90 &&
+      *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x1DC)==0 &&
+      *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)==2 &&
+      *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(fb)+0x1D0)==ctl;
+    auto &last=callbackXE->tglDisplayWakeLevel;
+    if(fbReady && (receipt[3]&TGLDisplayWakePWM::PWMEnable) &&
+       !(receipt[3]&~(TGLDisplayWakePWM::PWMEnable|TGLDisplayWakePWM::PWMPolarity)) &&
+       receipt[4] && receipt[4]!=UINT32_MAX &&
+       receipt[5] && receipt[5]<=receipt[4] && receipt[2]==receipt[5]) {
+     // Publish valid last: all fields are written before the release.
+     __atomic_store_n(&last.valid,false,__ATOMIC_RELEASE);
+     last.framebuffer=fb;last.controller=ctl;
+     last.period=receipt[4];last.duty=receipt[5];
+     __atomic_store_n(&last.valid,true,__ATOMIC_RELEASE);
+    }
+    // Keep a bounded trace of native duty writes, including ZERO writes,
+    // to determine whether a delayed fade runs after frame wake.
+    uint32_t trace[] {1,receipt[1],receipt[2],receipt[3],receipt[4],
+     receipt[5],fbReady?*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284):UINT32_MAX,
+     *reinterpret_cast<uint32_t *>(ctl+0xE58),
+     static_cast<uint32_t>(__atomic_load_n(&last.valid,__ATOMIC_ACQUIRE)),
+     last.duty};
+    char key[32];snprintf(key,sizeof(key),"TGLPWMWrite%u",receipt[1]%48U);
+    IORegistryEntry::getRegistryRoot()->setProperty(key,trace,sizeof(trace));
+   }
   }
  }
  if(trace)tglTransitionRecord(36,true,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
