@@ -3366,6 +3366,215 @@ uint32_t tglAUXCounts[9] {};
 // copies software records only; it never enters native mode/power or MMIO.
 TGLAUXRecord tglAUXControl[9][64] {};
 uint32_t tglAUXControlCounts[9] {};
+// Preserves the first failure across a retry-storm ring wrap.
+TGLAUXRecord tglEDPAUXFirstFailure {};
+// Diagnostic receipts never issue a new MMIO access. Native register hooks
+// report the values already read/written by the Apple donor.
+static uint32_t tglEDPAUXWakeEpoch {};
+struct TGLAUXNativeMMIO {
+ uint64_t ns, thread;
+ uint32_t word[8]; // seq, epoch, write(1)/read(0), reg, value, donor RVA, sample, reserved
+};
+static_assert(sizeof(TGLAUXNativeMMIO)==48, "AUX native MMIO receipt");
+static TGLAUXNativeMMIO tglEDPAUXMMIOFirst[64] {}, tglEDPAUXMMIOLast[256] {};
+static uint32_t tglEDPAUXMMIOCount {}, tglEDPAUXMMIOEpochCount {};
+// Sticky first-AUX command identity survives a later native AUX retry storm.
+// Multiple native AUX callers can interleave between DATA1 and SEND.
+/// Keep a bounded per-thread search history rather than one global last writer.
+static TGLAUXNativeMMIO tglEDPAUXRecentData1[16]{},tglEDPAUXFirstData1{},tglEDPAUXFirstCtl{};
+static uint32_t tglEDPAUXRecentData1Count{};
+
+// Separate read-only native panel power and HPD receipts from the high-volume
+// AUX_CTL ring. The native Apple register accessor performs the MMIO operation;
+// this observer never reads any hardware on its own.
+constexpr size_t tglEDPPanelSlots=6;
+static int tglEDPPanelRegisterSlot(unsigned long reg) {
+ switch(reg) {
+  case 0xC7200: return 0; // PP_STATUS
+  case 0xC7204: return 1; // PP_CONTROL
+  case 0xC7208: return 2; // PP_ON_DELAYS
+  case 0xC720C: return 3; // PP_OFF_DELAYS
+  case 0xC4000: return 4; // DDI_A HPD (donor-dependent interpretation)
+  case 0x44470: return 5; // TC HPD status; included to disambiguate port
+  default: return -1;
+ }
+}
+static TGLAUXNativeMMIO tglEDPPanelMMIOFirst[64]{},tglEDPPanelMMIOLast[128]{};
+static TGLAUXNativeMMIO tglEDPPanelLatest[tglEDPPanelSlots]{};
+static TGLAUXNativeMMIO tglEDPPanelPreAUX[tglEDPPanelSlots]{};
+static uint32_t tglEDPPanelMMIOCount{},tglEDPPanelMMIOEpochCount{};
+static uint32_t tglEDPPanelPreAUXValid{},tglEDPPanelFirstAUXEpoch{},tglEDPPanelFirstAUXSeq{};
+static uint64_t tglEDPPanelFirstAUXNS{};
+static void tglEDPPanelNativeMMIORecord(void *access,unsigned long reg,bool write,
+                                        uint32_t value,void *returnAddress,
+                                        bool diagEnabled,void *controllerAddress) {
+ if(!diagEnabled || !tglAUXLock || !access)return;
+ const int slot=tglEDPPanelRegisterSlot(reg);
+ if(slot<0)return;
+ auto controller=static_cast<uint8_t *>(controllerAddress);
+ if(!controller || *reinterpret_cast<void **>(controller+0xC40)!=access)return;
+ TGLAUXNativeMMIO receipt {};
+ uint64_t uptime;clock_get_uptime(&uptime);absolutetime_to_nanoseconds(uptime,&receipt.ns);
+ receipt.thread=reinterpret_cast<uintptr_t>(current_thread());
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ receipt.word[0]=++tglEDPPanelMMIOCount;
+ receipt.word[1]=tglEDPAUXWakeEpoch;
+ receipt.word[2]=write;
+ receipt.word[3]=static_cast<uint32_t>(reg);
+ receipt.word[4]=value;
+ receipt.word[5]=tglConnectionCaller(returnAddress);
+ receipt.word[6]=++tglEDPPanelMMIOEpochCount;
+ tglEDPPanelLatest[slot]=receipt;
+ if(receipt.word[6]<=arrsize(tglEDPPanelMMIOFirst))
+   tglEDPPanelMMIOFirst[receipt.word[6]-1]=receipt;
+ tglEDPPanelMMIOLast[(receipt.word[0]-1)%arrsize(tglEDPPanelMMIOLast)]=receipt;
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+}
+static bool tglEDPPanelNativeMMIOSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ constexpr size_t firstSize=sizeof(tglEDPPanelMMIOFirst);
+ constexpr size_t lastSize=sizeof(tglEDPPanelMMIOLast);
+ auto raw=static_cast<uint8_t *>(IOMalloc(16+firstSize+lastSize));
+ if(!raw)return false;
+ auto h=reinterpret_cast<uint32_t *>(raw);
+ h[0]=1;h[2]=64;h[3]=sizeof(TGLAUXNativeMMIO);
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ h[1]=tglEDPPanelMMIOCount;
+ memcpy(raw+16,tglEDPPanelMMIOFirst,firstSize);
+ memcpy(raw+16+firstSize,tglEDPPanelMMIOLast,lastSize);
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(raw,16+firstSize+lastSize);
+ IOFree(raw,16+firstSize+lastSize);
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+struct TGLPanelPreAUXWitness {
+ uint32_t version,epoch,auxEpoch,auxSequence,validMask,slots,itemSize,reserved;
+ uint64_t firstAuxNS;
+ TGLAUXNativeMMIO last[tglEDPPanelSlots];
+};
+static_assert(sizeof(TGLPanelPreAUXWitness)==40+48*tglEDPPanelSlots,
+              "pre-AUX panel snapshot schema");
+static bool tglEDPPanelPreAUXSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ TGLPanelPreAUXWitness witness {};
+ witness.version=1;witness.slots=tglEDPPanelSlots;witness.itemSize=sizeof(TGLAUXNativeMMIO);
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ witness.epoch=tglEDPAUXWakeEpoch;
+ witness.auxEpoch=tglEDPPanelFirstAUXEpoch;
+ witness.auxSequence=tglEDPPanelFirstAUXSeq;
+ witness.firstAuxNS=tglEDPPanelFirstAUXNS;
+ witness.validMask=tglEDPPanelPreAUXValid;
+ memcpy(witness.last,tglEDPPanelPreAUX,sizeof(witness.last));
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(&witness,sizeof(witness));
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static void tglEDPAUXNativeMMIORecord(void *access, unsigned long reg, bool write,
+                                     uint32_t value, void *returnAddress,
+                                     bool diagEnabled, void *controllerAddress) {
+ if(!diagEnabled || !tglAUXLock ||
+    (reg!=0x64010 && reg!=0x64014 && reg!=0x45444 && reg!=0x45454 &&
+     reg!=0x45404 && reg!=0x45504))return;
+ auto controller=static_cast<uint8_t *>(controllerAddress);
+ if(!controller || !access || *reinterpret_cast<void **>(controller+0xC40)!=access)return;
+ TGLAUXNativeMMIO receipt {};
+ uint64_t ticks;clock_get_uptime(&ticks);absolutetime_to_nanoseconds(ticks,&receipt.ns);
+ receipt.thread=reinterpret_cast<uintptr_t>(current_thread());
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ receipt.word[0]=++tglEDPAUXMMIOCount;
+ receipt.word[1]=tglEDPAUXWakeEpoch;
+ receipt.word[2]=write;
+ receipt.word[3]=static_cast<uint32_t>(reg);
+ receipt.word[4]=value;
+ receipt.word[5]=tglConnectionCaller(returnAddress);
+ receipt.word[6]=++tglEDPAUXMMIOEpochCount;
+ if(write && reg==0x64014) {
+  tglEDPAUXRecentData1[tglEDPAUXRecentData1Count%arrsize(tglEDPAUXRecentData1)]=receipt;
+  ++tglEDPAUXRecentData1Count;
+ }
+ // DATA1 (0x64014) is passively recorded before SEND, to identify the
+ // first native AUX request header without issuing any MMIO reads.
+ // The first actual AUX SEND of an epoch freezes whatever donor panel/HPD
+ // receipts already exist. Missing entries remain explicitly absent.
+ if(write && reg==0x64010 && (value&0x80000000U) &&
+    tglEDPAUXWakeEpoch && tglEDPPanelFirstAUXEpoch!=tglEDPAUXWakeEpoch) {
+  tglEDPPanelFirstAUXEpoch=tglEDPAUXWakeEpoch;
+  tglEDPAUXFirstCtl=receipt;
+  tglEDPAUXFirstData1={};
+  const size_t count=tglEDPAUXRecentData1Count<arrsize(tglEDPAUXRecentData1)
+      ? tglEDPAUXRecentData1Count:arrsize(tglEDPAUXRecentData1);
+  for(size_t i=0;i<count;++i) {
+   const auto &prior=tglEDPAUXRecentData1[
+       (tglEDPAUXRecentData1Count-1-i)%arrsize(tglEDPAUXRecentData1)];
+   if(prior.word[0] && prior.word[1]==tglEDPAUXWakeEpoch &&
+      prior.word[0]<receipt.word[0] &&
+      prior.thread==receipt.thread && prior.ns<=receipt.ns) {
+     tglEDPAUXFirstData1=prior;
+     break;
+   }
+  }
+  tglEDPPanelFirstAUXSeq=receipt.word[0];
+  tglEDPPanelFirstAUXNS=receipt.ns;
+  tglEDPPanelPreAUXValid=0;
+  for(size_t i=0;i<tglEDPPanelSlots;++i) {
+   const auto &panel=tglEDPPanelLatest[i];
+   if(panel.word[0] && panel.word[1]==tglEDPAUXWakeEpoch &&
+      panel.ns<=receipt.ns) {
+    tglEDPPanelPreAUX[i]=panel;
+    tglEDPPanelPreAUXValid|=1U<<i;
+   } else tglEDPPanelPreAUX[i]={};
+  }
+ }
+ if(receipt.word[6]<=arrsize(tglEDPAUXMMIOFirst))
+   tglEDPAUXMMIOFirst[receipt.word[6]-1]=receipt;
+ tglEDPAUXMMIOLast[(receipt.word[0]-1)%arrsize(tglEDPAUXMMIOLast)]=receipt;
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+}
+struct TGLAUXFirstCommandWitness {
+ uint32_t version,epoch,auxValid,dataValid,reserved[4];
+ TGLAUXNativeMMIO auxCtl,data1;
+};
+static_assert(sizeof(TGLAUXFirstCommandWitness)==128,
+              "sticky native first AUX command witness");
+static bool tglEDPAUXFirstCommandSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ TGLAUXFirstCommandWitness w {};
+ w.version=1;
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ w.epoch=tglEDPAUXWakeEpoch;
+ if(tglEDPAUXFirstCtl.word[0] &&
+    tglEDPAUXFirstCtl.word[1]==tglEDPAUXWakeEpoch) {
+  w.auxValid=1;w.auxCtl=tglEDPAUXFirstCtl;
+  if(tglEDPAUXFirstData1.word[0] &&
+     tglEDPAUXFirstData1.word[1]==tglEDPAUXWakeEpoch) {
+   w.dataValid=1;w.data1=tglEDPAUXFirstData1;
+  }
+ }
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(&w,sizeof(w));
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static bool tglEDPAUXNativeMMIOSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ constexpr size_t firstSize=sizeof(tglEDPAUXMMIOFirst);
+ constexpr size_t lastSize=sizeof(tglEDPAUXMMIOLast);
+ auto raw=static_cast<uint8_t *>(IOMalloc(16+firstSize+lastSize));
+ if(!raw)return false;
+ auto h=reinterpret_cast<uint32_t *>(raw);
+ h[0]=1;h[2]=64;h[3]=sizeof(TGLAUXNativeMMIO);
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ h[1]=tglEDPAUXMMIOCount;
+ memcpy(raw+16,tglEDPAUXMMIOFirst,firstSize);
+ memcpy(raw+16+firstSize,tglEDPAUXMMIOLast,lastSize);
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(raw,16+firstSize+lastSize);
+ IOFree(raw,16+firstSize+lastSize);
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 
 static void tglComboAUXDecisionRecord(uint32_t *word) {
  if(!tglAUXLock)return;
@@ -3538,7 +3747,9 @@ static bool tglDPCDSerialize(void *, void *, OSSerialize *serializer) {
 }
 
 void tglAUXRecord(void *port, uint32_t event, bool done, uint32_t result,
-	uint32_t a, uint32_t b, uint32_t header = 0, uint32_t packet = 0) {
+	uint32_t a, uint32_t b, uint32_t header = 0, uint32_t packet = 0,
+	uint32_t extra0 = 0, uint32_t extra1 = 0, uint32_t extra2 = 0,
+	uint32_t extra3 = 0) {
 	if (!tglAUXLock || !port) return;
 	auto bytes = static_cast<uint8_t *>(port);
 	auto config = *reinterpret_cast<uint32_t **>(bytes + 0x548);
@@ -3556,15 +3767,19 @@ void tglAUXRecord(void *port, uint32_t event, bool done, uint32_t result,
 	w[7] = a; w[8] = b;
 	w[9] = *reinterpret_cast<uint32_t *>(bytes + 0x594);
 	w[24] = header; w[25] = packet;
+	if(event==14) {w[10]=extra0;w[11]=extra1;w[12]=extra2;w[13]=extra3;}
 	// This observer also runs before AUX power get and after the last put.
 	// It owns no power reference: do not read the MMIO manager or registers.
-	// Keep the 128-byte layout. [10..23]/[26] are unsampled, not zero-valued
+	// Keep the 128-byte layout. Event14 uses [10..13]; otherwise unused words are not hardware reads.
 	// hardware; [27] is the MEM1 schema marker rather than old DC_STATE_EN.
 	w[27] = 0x4D454D31;
 	IOSimpleLockLock(tglAUXLock);
 	w[0] = ++tglAUXCounts[ddi];
+ if(event==14)w[26]=tglEDPAUXWakeEpoch; // 0 is pre-wake, >0 uniquely tags a display wake
 	if (w[0] <= 256) tglAUXFirst[ddi][w[0]-1] = record;
 	tglAUXLast[ddi][(w[0]-1) % 128] = record;
+	if(event==14 && ddi==0 && done && result && !tglEDPAUXFirstFailure.word[0])
+	 tglEDPAUXFirstFailure=record;
  if(event==1 || event>=5) {
   const auto control=++tglAUXControlCounts[ddi];
   tglAUXControl[ddi][(control-1)%64]=record;
@@ -3576,6 +3791,14 @@ void tglAUXRecord(void *port, uint32_t event, bool done, uint32_t result,
 // in ring order. Existing MEM1 records carry timestamp/sequence and mode.
 // event7=provider probe, 8=mode-lock wait, 9=parent PG get/put boundary
 // (a=PG refs, b=AUX refs, header=extra refs, packet=1 get/0 put).
+// Export a memory-only first-failure receipt, never probe MMIO while serializing.
+static bool tglEDPAUXFirstFailureSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ TGLAUXRecord r {};
+ IOSimpleLockLock(tglAUXLock);r=tglEDPAUXFirstFailure;IOSimpleLockUnlock(tglAUXLock);
+ auto data=OSData::withBytes(&r,sizeof(r));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool tglAUXControlSerialize(void *,void *reference,OSSerialize *serializer) {
  const auto ddi=reinterpret_cast<uintptr_t>(reference);
  if(ddi>=9 || !tglAUXLock)return false;
@@ -13038,12 +13261,12 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGRouteGammaWrites", routed);
 				patcher.clearError();
 			}
-            // Experimental Tiger Lake display-only Doze(1)->Wake(2) fix.
-            // An exact donor guard ensures we never wrap unknown FB state ABIs.
-            // Normal system Sleep/Wake and Display13 use their existing routes.
+            // Experimental PWM recovery is intentionally disabled: the old boot arg
+            // remains accepted by OpenCore but cannot cause PWM writes here.
+            // Route only a read-only FB0 wake epoch marker for AUX diagnostics.
             if (tglActive && xeProfile.family==XELP::Family::TigerLake &&
                 !display13FramebufferRequested &&
-                checkKernelArgument("-wex-tgl-displaywake-pwm")) {
+                checkKernelArgument("-wex-tgl-edp-refdiag")) {
                 const char *symbol="__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj";
                 const uint8_t entry[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,
                     0x53,0x50,0x41,0x89,0xF6,0x49,0x89,0xFF,0x48,0xFF,0x05,0xF1};
@@ -13052,10 +13275,11 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
                     !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
                 patcher.clearError();
                 KernelPatcher::RouteRequest route(symbol,wrapTGLDisplayWakePWM,orgTGLDisplayWakePWM);
-                tglDisplayWakePWMRouteReady=known && orgTGLRegisterRead && orgTGLRegisterWrite &&
-                    patcher.routeMultiple(index,&route,1,address,size);
+                const bool diagnosticRoute=known && patcher.routeMultiple(index,&route,1,address,size);
+                tglDisplayWakePWMRouteReady=false; // no experimental PWM repair/write path
                 patcher.clearError();
-                IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayWakePWMRouteReady",tglDisplayWakePWMRouteReady);
+                IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayWakePWMRouteReady",false);
+                IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPDiagWakeRouteReady",diagnosticRoute);
             }
 
 			{
@@ -13299,7 +13523,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			}
 			tglAUXLock = IOSimpleLockAlloc();
 			tglDisplayTraceEnabled=checkKernelArgument("-wex-display-trace");
-   tglInitTransitionTrace(tglDisplayTraceEnabled);
+   // Initialized after the eDP diagnostic gate is known; this keeps the trace memory-only.
 			if (tglConnectionLock) {
 				KernelPatcher::RouteRequest link("__ZN14AppleIntelPort15checkLinkStatusEv",
 					wrapTGLCheckLinkStatus, orgTGLCheckLinkStatus);
@@ -13362,7 +13586,10 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				tglEDPRefDiagRequested=tglAUXParentReady &&
 					XELP::displayAdapter(xeProfile.family)==XELP::DisplayAdapter::TGL &&
 					checkKernelArgument("-wex-tgl-edp-refdiag");
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPRefDiagReady",tglEDPRefDiagRequested);
+				tglInitTransitionTrace(tglDisplayTraceEnabled || tglEDPRefDiagRequested);
+                IORegistryEntry::getRegistryRoot()->setProperty(
+                    "TGLComboClockTraceReady",tglEDPRefDiagRequested && tglTransitionLock);
+                IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPRefDiagReady",tglEDPRefDiagRequested);
 				patcher.clearError();
 			}
    // Resolve the base setter, never the HAL setter with fixed FIA writes.
@@ -14068,164 +14295,37 @@ void XE::wrapADLSPanelPWMEnable(void *access) {
 // This remains opt-in and is never used for the system Sleep(0) path.
 // Hardware registers are accessed only with an owned native PG1 reference.
 uint32_t XE::wrapTGLDisplayWakePWM(IOService *fb,uint32_t requested) {
- auto s=callbackXE;
- const auto b=reinterpret_cast<uint8_t *>(fb);
- const bool enough=fb && fb->getMetaClass()->getClassSize()>=0x4B90;
- const uint32_t prior=enough ? *reinterpret_cast<const uint32_t *>(b+0x4284) : UINT32_MAX;
- // Capture the last ACTUAL visible PWM level before native Wake->Doze.
- // The donor can zero both duty and its cached brightness during Doze;
- // the post-wake callback must not guess a new brightness from zero.
- if(requested==0)__atomic_store_n(&s->tglDisplayWakeLevel.valid,false,__ATOMIC_RELEASE);
- if(prior==2 && requested==1) {
-  auto &last=s->tglDisplayWakeLevel;
-  // Do not discard the last observed positive native PWM write here:
-  // display fade may already have written duty=0 before entering Doze.
-  if(enough && s->tglActive && s->xeProfile.family==XELP::Family::TigerLake &&
-     s->tglDisplayWakePWMRouteReady && s->tglTCNativeFunctions.complete() &&
-     s->orgTGLRegisterRead && s->orgTGLRegisterWrite &&
-     s->tglObservationController && *reinterpret_cast<const uint32_t *>(b+0x1DC)==0) {
-   auto controller=static_cast<uint8_t *>(s->tglObservationController);
-   auto &f=s->tglTCNativeFunctions;
-   if(*reinterpret_cast<void **>(b+0x1D0)==controller &&
-      *f.controllerSlot==controller && !controller[0x918] &&
-      !*reinterpret_cast<void **>(controller+0xD0)) {
-    auto port=static_cast<uint8_t *>(f.portByDDI(0));
-    if(port && !port[0x117] && *reinterpret_cast<uint32_t *>(port+0x550)==1 &&
-       *reinterpret_cast<void **>(port+0x548) &&
-       **reinterpret_cast<uint32_t **>(port+0x548)==0) {
-     auto power=*reinterpret_cast<uint8_t **>(controller+0xC8);
-     auto access=*reinterpret_cast<uint8_t **>(controller+0xC40);
-     if(power && access && !power[0x18] &&
-        *reinterpret_cast<void **>(power+0x10)==controller &&
-        *reinterpret_cast<void **>(power+0x78)==access &&
-        *reinterpret_cast<void **>(port+0x578)==access &&
-        *reinterpret_cast<void **>(access+0x50) &&
-        *reinterpret_cast<uint32_t *>(access+0x60)>=0xC825CU) {
-      const auto read=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead);
-      f.getPG(power,1);
-      const auto wells=read(access,0x45404),fuse=read(access,0x42000);
-      if(TGLDisplayWakePWM::pg1Ready(wells,fuse)) {
-       const auto panel=read(access,0xC7200),ctl=read(access,0xC8250);
-       const auto period=read(access,0xC8254),duty=read(access,0xC8258);
-       if(panel!=UINT32_MAX && (panel&TGLDisplayWakePWM::PanelOn) &&
-          ctl!=UINT32_MAX && (ctl&TGLDisplayWakePWM::PWMEnable) &&
-          !(ctl&~(TGLDisplayWakePWM::PWMEnable|TGLDisplayWakePWM::PWMPolarity)) &&
-          period && period!=UINT32_MAX && duty && duty<=period) {
-        last.framebuffer=fb;last.controller=controller;
-        __atomic_store_n(&last.valid,false,__ATOMIC_RELEASE);
-        last.period=period;last.duty=duty;
-        __atomic_store_n(&last.valid,true,__ATOMIC_RELEASE);
-       }
-      }
-      f.putPG(power,1);
-     }
-    }
-   }
-  }
-  // The original FB state is still Wake here; report whether an earlier
-  // native-positive MMIO receipt survived (or a fresh pre-Doze read worked).
-  uint32_t dozeReceipt[] {1,prior,requested,
-   static_cast<uint32_t>(__atomic_load_n(&last.valid,__ATOMIC_ACQUIRE)),
-   last.period,last.duty};
-  IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayDozeCapture",
-                                                    dozeReceipt,sizeof(dozeReceipt));
- }
- const auto result=FunctionCast(wrapTGLDisplayWakePWM,s->orgTGLDisplayWakePWM)(fb,requested);
- if(result || prior!=1 || requested!=2 || !enough || !s->tglActive ||
-    s->xeProfile.family!=XELP::Family::TigerLake || !s->tglDisplayWakePWMRouteReady ||
-    !s->tglTCNativeFunctions.complete() || !s->orgTGLRegisterRead ||
-    !s->orgTGLRegisterWrite || !s->tglObservationController ||
-    *reinterpret_cast<const uint32_t *>(b+0x4284)!=2 ||
-    *reinterpret_cast<const uint32_t *>(b+0x1DC)!=0)return result;
- auto controller=static_cast<uint8_t *>(s->tglObservationController);
- if(*reinterpret_cast<void **>(b+0x1D0)!=controller ||
-    *s->tglTCNativeFunctions.controllerSlot!=controller ||
-    controller[0x918] || *reinterpret_cast<void **>(controller+0xD0))return result;
- auto port=static_cast<uint8_t *>(s->tglTCNativeFunctions.portByDDI(0));
- if(!port || port[0x117] || *reinterpret_cast<uint32_t *>(port+0x550)!=1 ||
-    !*reinterpret_cast<void **>(port+0x548))return result;
- auto cfg=*reinterpret_cast<const uint32_t **>(port+0x548);
- if(cfg[0]!=0)return result;
- auto power=*reinterpret_cast<uint8_t **>(controller+0xC8);
- auto access=*reinterpret_cast<uint8_t **>(controller+0xC40);
- if(!power || !access || power[0x18] ||
-    *reinterpret_cast<void **>(power+0x10)!=controller ||
-    *reinterpret_cast<void **>(power+0x78)!=access ||
-    *reinterpret_cast<void **>(port+0x578)!=access ||
-    !*reinterpret_cast<void **>(access+0x50) ||
-    *reinterpret_cast<uint32_t *>(access+0x60)<0xC825CU)return result;
- const auto read=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead);
- const auto write=FunctionCast(wrapTGLRegisterWrite,s->orgTGLRegisterWrite);
- TGLDisplayWakePWM::Readout snap {};
- snap.priorState=prior;snap.requestedState=requested;
- snap.actualState=*reinterpret_cast<const uint32_t *>(b+0x4284);
- snap.qualified=true;snap.independentPWM=true;
- // The IOBacklightDisplay user request is independent of the donor's E58
- // cache, which may have been zeroed by an asynchronous display fade.
- // Read only the property under the IORegistry lock. No GPU MMIO here.
- if(fb) {
-  auto paramsObject=fb->copyProperty("IODisplayParameters",gIOServicePlane,
-                                    kIORegistryIterateRecursively);
-  auto params=OSDynamicCast(OSDictionary,paramsObject);
-  auto brightness=params ? OSDynamicCast(OSDictionary,params->getObject("brightness")) : nullptr;
-  auto level=brightness ? OSDynamicCast(OSNumber,brightness->getObject("value")) : nullptr;
-  auto maximum=brightness ? OSDynamicCast(OSNumber,brightness->getObject("max")) : nullptr;
-  if(level && maximum) {
-   snap.requestedBrightness=level->unsigned32BitValue();
-   snap.maximumBrightness=maximum->unsigned32BitValue();
-  }
-  if(paramsObject)paramsObject->release();
- }
- auto &f=s->tglTCNativeFunctions;
- f.getPG(power,1);
- const auto wells=read(access,0x45404),fuse=read(access,0x42000);
- // getPG(power,1) acquires PG1. 0x42000 bit 24 describes PG3,
- // so requiring it can suppress a valid display-only recovery.
- const bool ready=TGLDisplayWakePWM::pg1Ready(wells,fuse);
- snap.powerReady=ready;
- if(ready) {
-  snap.panelStatus=read(access,0xC7200);
-  snap.control=read(access,0xC8250);
-  snap.period=read(access,0xC8254);
-  snap.duty=read(access,0xC8258);
-  snap.nativeBrightness=*reinterpret_cast<const uint32_t *>(controller+0xE58);
-  const auto &last=s->tglDisplayWakeLevel;
-  if(__atomic_load_n(&last.valid,__ATOMIC_ACQUIRE) &&
-     last.framebuffer==fb && last.controller==controller &&
-     last.period==snap.period) snap.preDozeDuty=last.duty;
- }
- const bool should=TGLDisplayWakePWM::rearm(snap);
- uint32_t after=snap.control;
- uint32_t dutyAfter=snap.duty;
- if(should && *reinterpret_cast<const uint32_t *>(b+0x4284)==2) {
-  // Reapply the exact native duty formula when Doze erased the duty MMIO.
-  // Do not rewrite the level if it is already nonzero.
-  if(TGLDisplayWakePWM::restoreDutyRequired(snap)) {
-   write(access,0xC8258,TGLDisplayWakePWM::restoredDuty(snap));
-   dutyAfter=read(access,0xC8258);
-  }
-  if(dutyAfter==TGLDisplayWakePWM::restoredDuty(snap) &&
-     !(snap.control&TGLDisplayWakePWM::PWMEnable)) {
-   // Only re-enable if disabled: when enabled with duty=0, write duty only.
-   write(access,0xC8250,TGLDisplayWakePWM::enabledControl(snap));
-   after=read(access,0xC8250);
+ // Strictly read-only diagnostic: no MMIO, power-well gets, PWM changes,
+ // user brightness guesses, or extra native framebuffer operations.
+ // This hook is installed only on the exact 24H232 donor with
+ // -wex-tgl-edp-refdiag; the old -wex-tgl-displaywake-pwm is inert.
+ auto self=callbackXE;
+ if(self && self->tglEDPRefDiagRequested && fb && requested==2 &&
+    fb->getMetaClass()->getClassSize()>=0x4B90) {
+  auto b=reinterpret_cast<const uint8_t *>(fb);
+  if(*reinterpret_cast<const uint32_t *>(b+0x1DC)==0 &&
+     *reinterpret_cast<const uint32_t *>(b+0x4284)==1 && tglAUXLock) {
+   const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+   ++tglEDPAUXWakeEpoch;
+   tglEDPAUXMMIOEpochCount=0;
+   bzero(tglEDPAUXMMIOFirst,sizeof(tglEDPAUXMMIOFirst));
+   tglEDPPanelMMIOEpochCount=0;
+   bzero(tglEDPPanelMMIOFirst,sizeof(tglEDPPanelMMIOFirst));
+   bzero(tglEDPPanelLatest,sizeof(tglEDPPanelLatest));
+   bzero(tglEDPPanelPreAUX,sizeof(tglEDPPanelPreAUX));
+   tglEDPPanelPreAUXValid=0;
+   tglEDPPanelFirstAUXEpoch=0;
+   tglEDPPanelFirstAUXSeq=0;
+   tglEDPPanelFirstAUXNS=0;
+   bzero(tglEDPAUXRecentData1,sizeof(tglEDPAUXRecentData1));
+   tglEDPAUXRecentData1Count=0;
+   tglEDPAUXFirstCtl={};
+   tglEDPAUXFirstData1={};
+   tglEDPAUXFirstFailure={};
+   IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
   }
  }
- f.putPG(power,1);
- // Append the raw power receipts so a false readiness result is diagnosable.
- // Keep pre-existing fields at fixed indices for older readers.
- uint32_t record[] {5,prior,requested,snap.actualState,
-  snap.panelStatus,snap.control,after,snap.period,snap.duty,
-  static_cast<uint32_t>(ready),static_cast<uint32_t>(should),
-  static_cast<uint32_t>(should && (after&TGLDisplayWakePWM::PWMEnable) &&
-                        dutyAfter==TGLDisplayWakePWM::restoredDuty(snap)),
-  snap.nativeBrightness,dutyAfter,wells,fuse,
-  snap.preDozeDuty,static_cast<uint32_t>(s->tglDisplayWakeLevel.valid),
-  snap.requestedBrightness,snap.maximumBrightness};
- IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayWakePWMRepair",record,sizeof(record));
- // The same validated level remains eligible across display-only epochs,
- // until overwritten by another positive native level or system sleep(0).
- return result;
+ return FunctionCast(wrapTGLDisplayWakePWM,self->orgTGLDisplayWakePWM)(fb,requested);
 }
 
 bool XE::wrapTGLPanelPowerProperty(IORegistryEntry *framebuffer, const char *, OSObject *value) {
@@ -14486,6 +14586,23 @@ bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
  }
  if(auto live=OSSerializer::forTarget(nullptr,tglComboAUXDecisionSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeComboAUXDecisions",live);live->release();
+ }
+ if(callbackXE->tglEDPRefDiagRequested) {
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPAUXFirstFailureSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPAUXFirstFailure",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPAUXNativeMMIOSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPAUXNativeMMIO",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPAUXFirstCommandSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPAUXFirstCommand",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPPanelNativeMMIOSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPPanelNativeMMIO",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPPanelPreAUXSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPPanelPreAUX",live);live->release();
+  }
  }
  for(uintptr_t ddi=0;ddi<=8;++ddi) {
   if(ddi==2)continue; // TGL combo A/B and TC D..I; no combo C.
@@ -17657,11 +17774,33 @@ void XE::wrapTGLDisableAUXPower(void *power, uint32_t ddi) {
 }
 
 uint32_t XE::wrapTGLRunAUX(void *port, uint32_t command, uint32_t *packet, uint32_t length, bool flag) {
+ // Software-only boundary receipts. No additional MMIO or power references:
+ // the real donor AUX_CTL and ACK values are captured by the original
+ // ReadRegister32/WriteRegister32 intercepts INSIDE native lock ownership.
+ auto witness = [&](bool done, uint32_t result) {
+  auto self=callbackXE;
+  if(!self || !self->tglEDPRefDiagRequested || !self->tglActive ||
+     !self->tglObservationController || !port)return;
+  auto p=static_cast<uint8_t *>(port);
+  auto cfg=*reinterpret_cast<uint32_t **>(p+0x548);
+  if(!cfg || cfg[0]!=0)return;
+  auto controller=static_cast<uint8_t *>(self->tglObservationController);
+  auto power=*reinterpret_cast<uint8_t **>(controller+0xC8);
+  uint32_t nativeAux=UINT32_MAX,nativeDDI=UINT32_MAX;
+  if(power && *reinterpret_cast<void **>(power+0x10)==controller) {
+   nativeAux=*reinterpret_cast<uint32_t *>(power+0x54);
+   nativeDDI=*reinterpret_cast<uint32_t *>(power+0x30);
+  }
+  tglAUXRecord(port,14,done,result,UINT32_MAX,UINT32_MAX,
+               UINT32_MAX,UINT32_MAX,nativeAux,nativeDDI,cfg[2],cfg[3]);
+ };
 	const auto header = packet && length >= 4 ? packet[0] : 0;
 	const uint32_t args = length | (static_cast<uint32_t>(flag) << 16);
+	witness(false,0);
 	tglAUXRecord(port, 0, false, 0, command, args, header, header);
 	const auto result = FunctionCast(wrapTGLRunAUX, callbackXE->orgTGLRunAUX)(port, command, packet, length, flag);
 	tglAUXRecord(port, 0, true, result, command, args, header, packet && length >= 4 ? packet[0] : 0);
+	witness(true,result);
 	return result;
 }
 
@@ -17905,6 +18044,8 @@ uint32_t XE::wrapTGLRegisterRead(void *access, unsigned long reg) {
  const bool trace=tglTransitionRegister(reg);
  if(trace)tglTransitionRecord(35,false,access,reg,tglConnectionCaller(__builtin_return_address(0)),0);
 	auto value = FunctionCast(wrapTGLRegisterRead, callbackXE->orgTGLRegisterRead)(access, reg);
+ tglEDPAUXNativeMMIORecord(access,reg,false,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
+ tglEDPPanelNativeMMIORecord(access,reg,false,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
  if(trace)tglTransitionRecord(35,true,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
 	const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 	auto s = callbackXE;
@@ -19297,9 +19438,26 @@ volatile uint8_t *XE::tglClockOrderTarget(void *controller, void *port, void *pa
 void XE::wrapTGLDisableClocks(void *controller, void *port, void *otherPort) {
  auto config=port?*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port)+0x548):nullptr;
  const bool combo=callbackXE->adlsDisplaySelected || (config && config[0]<2);
+ const uint32_t ddi=config?config[0]:UINT32_MAX;
  bool keepPLL=false;
- if(combo && (!comboClockTarget(controller,port,otherPort) || !comboBeginClock(controller,port,false,keepPLL))) {
-  IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockDisableRejected",true);return;
+ if(combo) {
+  tglTransitionRecord(130,false,port,ddi,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(otherPort));
+  uint32_t targetReason=0,targetDetail=0;
+  const bool target=comboClockTarget(controller,port,otherPort,&targetReason,&targetDetail);
+  tglTransitionRecord(131,true,port,ddi,target,targetReason,&targetDetail,sizeof(targetDetail));
+  if(!target) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockDisableRejected",true);
+   return;
+  }
+  uint32_t beginReason=0,beginDetail=0;
+  const bool begun=comboBeginClock(controller,port,false,keepPLL,nullptr,&beginReason,&beginDetail);
+  tglTransitionRecord(132,true,port,ddi,begun,beginReason,&beginDetail,sizeof(beginDetail));
+  if(!begun) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockDisableRejected",true);return;
+  }
+ } else {
+  const uint32_t bypassReason=config?1U:2U;
+  tglTransitionRecord(136,false,port,ddi,bypassReason,reinterpret_cast<uintptr_t>(otherPort));
  }
  tglTransitionRecord(32,false,port,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(otherPort),0);
 	auto s = callbackXE;
@@ -19338,8 +19496,13 @@ void XE::wrapTGLDisableClocks(void *controller, void *port, void *otherPort) {
 	if (owned && tx.pending) { tx.pending = false; wrapTGLRegisterWrite(tx.access, tx.clockReg, tx.value); }
 	// The donor's self-sharing argument gates the output and releases its DDI
 	// reference, but leaves the shared PLL running and recalculates voltage.
+ if(combo)tglTransitionRecord(133,false,port,ddi,reinterpret_cast<uintptr_t>(otherPort),keepPLL);
 	FunctionCast(wrapTGLDisableClocks, s->orgTGLDisableClocks)(controller, port, combo?(keepPLL?port:nullptr):otherPort);
- if(combo)comboEndClock();
+ if(combo)tglTransitionRecord(134,true,port,ddi,reinterpret_cast<uintptr_t>(otherPort),keepPLL);
+ if(combo) {
+  comboEndClock();
+  tglTransitionRecord(135,true,port,ddi,0,0);
+ } else tglTransitionRecord(137,true,port,ddi,0,0);
  tglTransitionRecord(32,true,port,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(otherPort),0);
 }
 
@@ -19375,21 +19538,56 @@ bool XE::adlsClockTarget(void *controller,void *port,void *otherPort) {
         *reinterpret_cast<uint32_t *>(access+0x60)>=0x1642C8;
 }
 
-bool XE::comboClockTarget(void *controller,void *port,void *otherPort) {
+bool XE::comboClockTarget(void *controller,void *port,void *otherPort,
+                          uint32_t *reason,uint32_t *detail) {
+    if(reason)*reason=0;
+    if(detail)*detail=0;
+    auto reject=[&](uint32_t code,uint32_t value=0U)->bool {
+        if(reason)*reason=code;
+        if(detail)*detail=value;
+        return false;
+    };
     auto s=callbackXE;
-    if(s->adlsDisplaySelected)return adlsClockTarget(controller,port,otherPort);
-    if(!controller || !port || (otherPort && otherPort!=port && !comboClockTarget(controller,otherPort,nullptr)))return false;
+    if(!s)return reject(1);
+    if(s->adlsDisplaySelected) {
+        const bool ok=adlsClockTarget(controller,port,otherPort);
+        return ok?true:reject(2);
+    }
+    if(!controller)return reject(3);
+    if(!port)return reject(4);
+    if(otherPort && otherPort!=port) {
+        uint32_t nestedReason=0,nestedDetail=0;
+        if(!comboClockTarget(controller,otherPort,nullptr,&nestedReason,&nestedDetail))
+            return reject(5,((nestedReason&0xffffU)<<16)|(nestedDetail&0xffffU));
+    }
     auto p=static_cast<uint8_t *>(port),c=static_cast<uint8_t *>(controller);
     auto config=*reinterpret_cast<uint32_t **>(p+0x548);
     auto access=*reinterpret_cast<uint8_t **>(c+0xC40);
-    if(!config || config[0]>=2 || config[3] || config[2]>2 || !access || *reinterpret_cast<void **>(p+0x578)!=access ||
-       *reinterpret_cast<uint32_t *>(access+0x60)<0x164294 ||
-       *reinterpret_cast<uint32_t *>(p+0x5B8)!=(config[0]?0x6C10CU:0x16210CU))return false;
-    if(s->display13FramebufferRequested)return controller==s->adlnTopologyController &&
-        Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring);
-    return s->tglActive && controller==s->tglObservationController &&
-        XELP::displayAdapter(s->xeProfile.family)==XELP::DisplayAdapter::TGL &&
-        config==reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(s->tglPlatformCopy)+0x20+24*config[0]);
+    if(!config)return reject(6);
+    if(config[0]>=2)return reject(7,config[0]);
+    if(config[3])return reject(8,config[3]);
+    if(config[2]>2)return reject(9,config[2]);
+    if(!access)return reject(10);
+    if(*reinterpret_cast<void **>(p+0x578)!=access)return reject(11);
+    const auto mapSize=*reinterpret_cast<uint32_t *>(access+0x60);
+    if(mapSize<0x164294)return reject(12,mapSize);
+    const auto expected=config[0]?0x6C10CU:0x16210CU;
+    const auto portRegister=*reinterpret_cast<uint32_t *>(p+0x5B8);
+    if(portRegister!=expected)return reject(13,portRegister);
+    if(s->display13FramebufferRequested) {
+        const bool owner=controller==s->adlnTopologyController;
+        const bool selected=owner && Display13FBTopology::selected(
+            s->adlnPlatform,config,s->adlnOutputWiring);
+        return selected?true:reject(14,owner?1U:0U);
+    }
+    if(!s->tglActive)return reject(15);
+    if(controller!=s->tglObservationController)return reject(16);
+    const auto adapter=XELP::displayAdapter(s->xeProfile.family);
+    if(adapter!=XELP::DisplayAdapter::TGL)return reject(17,static_cast<uint32_t>(adapter));
+    auto expectedConfig=reinterpret_cast<uint32_t *>(
+        reinterpret_cast<uint8_t *>(s->tglPlatformCopy)+0x20+24*config[0]);
+    if(config!=expectedConfig)return reject(18);
+    return true;
 }
 
 bool XE::comboClockPower(void *power,bool acquire) {
@@ -19410,21 +19608,41 @@ void XE::comboClockWrite(void *access,unsigned long reg,uint32_t value) {
         s->orgDisplay13GMBusWrite:s->orgTGLRegisterWrite)(access,reg,value);
 }
 
-bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,void *other) {
+bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,void *other,
+                         uint32_t *reason,uint32_t *detail) {
+    if(reason)*reason=0;
+    if(detail)*detail=0;
+    auto reject=[&](uint32_t code,uint32_t value=0U)->bool {
+        if(reason)*reason=code;
+        if(detail)*detail=value;
+        return false;
+    };
     auto s=callbackXE;auto &t=comboClockTransaction;
+    if(!s)return reject(1);
+    if(!controller)return reject(12);
     auto c=static_cast<uint8_t *>(controller);
     auto access=*reinterpret_cast<uint8_t **>(c+0xC40);
     auto power=*reinterpret_cast<uint8_t **>(c+0xC8);
-    if(!t.lock || !power || *reinterpret_cast<void **>(power+0x10)!=controller ||
-       *reinterpret_cast<void **>(power+0x78)!=access || !*reinterpret_cast<void **>(access+0x50))return false;
+    uint32_t invalid=0;
+    if(!t.lock)invalid|=1U;
+    if(!power)invalid|=2U;
+    if(power && *reinterpret_cast<void **>(power+0x10)!=controller)invalid|=4U;
+    if(power && *reinterpret_cast<void **>(power+0x78)!=access)invalid|=8U;
+    if(!access)invalid|=16U;
+    else if(!*reinterpret_cast<void **>(access+0x50))invalid|=32U;
+    if(invalid)return reject(2,invalid);
     IORecursiveLockLock(t.lock);
-    if(t.thread){IORecursiveLockUnlock(t.lock);return false;}
-    if(!comboClockPower(power,true)){IORecursiveLockUnlock(t.lock);return false;}
+    if(t.thread){IORecursiveLockUnlock(t.lock);return reject(3);}
+    if(!comboClockPower(power,true)){IORecursiveLockUnlock(t.lock);return reject(4);}
     // DISPLAY_CORE must remain referenced from peer scan through readback.
     const auto pw=comboClockRead(access,0x45404);
-    if(pw==UINT32_MAX || (pw&3)!=3) {
-        comboClockPower(power,false);IORecursiveLockUnlock(t.lock);return false;
-    }
+    auto abort=[&](uint32_t code,uint32_t value)->bool {
+        comboClockPower(power,false);
+        IORecursiveLockUnlock(t.lock);
+        return reject(code,value);
+    };
+    if(pw==UINT32_MAX)return abort(5,pw);
+    if((pw&3)!=3)return abort(6,pw);
     const auto ddi=(*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port)+0x548))[0];
     XELPComboClock::Port route(s->adlsDisplaySelected?(ddi?ddi-2:0):ddi);
     XELPComboClock::ClockSnapshot snapshot;
@@ -19434,9 +19652,6 @@ bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,v
     if(s->adlsDisplaySelected)snapshot.mux[1]=comboClockRead(access,0x1642BC);
     for(unsigned i=0;i<snapshot.pllCount();++i){XELPComboClock::PLL pll;XELPComboClock::PLL::resolve(i,pll);snapshot.enable[i]=comboClockRead(access,pll.enable);}
     if(s->display13FramebufferRequested && display13FBPower.transcoders.dsi0Pipe<3) {
-        // The adoption boundary installs the qualified source/power binding
-        // before any native clock client. Revalidate here under the shared
-        // clock mutex, then pin its PLL even when DDI_CLK_OFF_A is set.
         const auto &source=display13FBPower.bootDSI;
         struct IO {
             void *access;bool parked;
@@ -19451,21 +19666,21 @@ bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,v
             io,source,t.allocation,owner,s->dsiRuntimePower.host) :
             (XELP::DSI::sourceUnchanged(io,source) &&
              t.allocation.retain(source.identity.phy,source.identity.pll,owner,snapshot));
-        if(source.identity.pipe!=display13FBPower.transcoders.dsi0Pipe ||
-           !retained) {
-            comboClockPower(power,false);IORecursiveLockUnlock(t.lock);return false;
-        }
+        if(source.identity.pipe!=display13FBPower.transcoders.dsi0Pipe)
+            return abort(7,source.identity.pipe);
+        if(!retained)return abort(8,source.identity.phy|(source.identity.pll<<8));
     }
     const auto otherConfig=other && other!=port ? *reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(other)+0x548):nullptr;
     const auto choice=enable && otherConfig ? t.allocation.share(XELPComboClock::Port(otherConfig[0]),snapshot):
         t.allocation.choose(route,snapshot,enable);
-    if(!choice.valid || route.phy>=snapshot.slots() || t.allocation.external[route.phy]) {
-        comboClockPower(power,false);IORecursiveLockUnlock(t.lock);return false;
-    }
+    if(!choice.valid)return abort(9,route.phy&0xffU);
+    if(route.phy>=snapshot.slots())return abort(10,(route.phy&0xffU)|((snapshot.slots()&0xffU)<<8));
+    if(t.allocation.external[route.phy])return abort(11,route.phy);
     if(enable)t.allocation.binding[route.phy]=choice.pll+1;
     t.translation={route.phy,choice.pll,enable};t.before=snapshot;
     t.access=access;t.power=power;t.keepPLL=keepPLL=choice.keepPLL;
     __atomic_store_n(&t.thread,reinterpret_cast<uintptr_t>(current_thread()),__ATOMIC_RELEASE);
+    if(detail)*detail=pw;
     return true;
 }
 
@@ -19497,15 +19712,32 @@ void XE::comboClockTranslateWrite(void *access,unsigned long &reg,uint32_t &valu
 
 void XE::wrapTGLComboEnableClocks(void *controller,void *port,void *other,uint32_t *params) {
     auto config=port?*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port)+0x548):nullptr;
+    const uint32_t ddi=config?config[0]:UINT32_MAX;
     if(config && config[0]<2) {
-        bool keep=false;
-        if(!comboClockTarget(controller,port,other) || !comboBeginClock(controller,port,true,keep,other)) {
+        tglTransitionRecord(120,false,port,ddi,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(other));
+        uint32_t targetReason=0,targetDetail=0;
+        const bool target=comboClockTarget(controller,port,other,&targetReason,&targetDetail);
+        tglTransitionRecord(121,true,port,ddi,target,targetReason,&targetDetail,sizeof(targetDetail));
+        if(!target) {
+            IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockEnableRejected",true);
+            tglTransitionRecord(122,true,port,ddi,0,targetReason,&targetDetail,sizeof(targetDetail));return;
+        }
+        bool keep=false;uint32_t beginReason=0,beginDetail=0;
+        const bool begun=comboBeginClock(controller,port,true,keep,other,&beginReason,&beginDetail);
+        tglTransitionRecord(123,true,port,ddi,begun,beginReason,&beginDetail,sizeof(beginDetail));
+        if(!begun) {
             IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockEnableRejected",true);return;
         }
+        tglTransitionRecord(124,false,port,ddi,reinterpret_cast<uintptr_t>(other),keep);
         FunctionCast(wrapTGLComboEnableClocks,callbackXE->orgComboEnableClocks)(controller,port,other,params);
-        comboEndClock();return;
+        tglTransitionRecord(125,true,port,ddi,reinterpret_cast<uintptr_t>(other),keep);
+        comboEndClock();
+        tglTransitionRecord(126,true,port,ddi,0,0);return;
     }
+    const uint32_t bypassReason=config?1U:2U;
+    tglTransitionRecord(127,false,port,ddi,bypassReason,reinterpret_cast<uintptr_t>(other));
     FunctionCast(wrapTGLComboEnableClocks,callbackXE->orgComboEnableClocks)(controller,port,other,params);
+    tglTransitionRecord(128,true,port,ddi,bypassReason,0);
 }
 
 void XE::wrapADLSEnableClocks(void *controller,void *port,void *otherPort,uint32_t *params) {
@@ -19827,6 +20059,8 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 		reinterpret_cast<uintptr_t>(__builtin_return_address(0))) : nullptr;
  const bool trace=tglTransitionRegister(reg);
  if(trace)tglTransitionRecord(36,false,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
+	tglEDPAUXNativeMMIORecord(access,reg,true,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
+	tglEDPPanelNativeMMIORecord(access,reg,true,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
 	FunctionCast(wrapTGLRegisterWrite, callbackXE->orgTGLRegisterWrite)(access, reg, value);
  // Keep the independent native PWM control writes; after a failed wake,
  // comparing these with duty receipts shows which write occurred last.
