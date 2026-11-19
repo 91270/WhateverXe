@@ -13261,9 +13261,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGRouteGammaWrites", routed);
 				patcher.clearError();
 			}
-            // Experimental PWM recovery is intentionally disabled: the old boot arg
-            // remains accepted by OpenCore but cannot cause PWM writes here.
-            // Route only a read-only FB0 wake epoch marker for AUX diagnostics.
+            // Mark FB0 display wake transitions for the AUX diagnostics.
             if (tglActive && xeProfile.family==XELP::Family::TigerLake &&
                 !display13FramebufferRequested &&
                 checkKernelArgument("-wex-tgl-edp-refdiag")) {
@@ -13274,10 +13272,10 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
                 const bool known=fn==address+0x24DE8 && size>0x24DE8+sizeof(entry) &&
                     !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
                 patcher.clearError();
-                KernelPatcher::RouteRequest route(symbol,wrapTGLDisplayWakePWM,orgTGLDisplayWakePWM);
+                KernelPatcher::RouteRequest route(symbol,wrapTGLFramebufferWakeEpoch,orgTGLFramebufferWakeEpoch);
                 const bool diagnosticRoute=known && patcher.routeMultiple(index,&route,1,address,size);
-                tglDisplayWakePWMRouteReady=false; // no experimental PWM repair/write path
                 patcher.clearError();
+                // Keep the status property for older diagnostic readers.
                 IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayWakePWMRouteReady",false);
                 IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPDiagWakeRouteReady",diagnosticRoute);
             }
@@ -14289,16 +14287,9 @@ void XE::wrapADLSPanelPWMEnable(void *access) {
  wrapTGLRegisterWrite(access,0xC8250,value);
 }
 
-// Display-only eDP resume does not necessarily execute LightUpEDP, which is
-// the native caller that writes BLC_PWM_CTL1=0x80000000. A successful
-// setFramebufferPowerState(2) can therefore leave PWM disabled after Doze.
-// This remains opt-in and is never used for the system Sleep(0) path.
-// Hardware registers are accessed only with an owned native PG1 reference.
-uint32_t XE::wrapTGLDisplayWakePWM(IOService *fb,uint32_t requested) {
- // Strictly read-only diagnostic: no MMIO, power-well gets, PWM changes,
- // user brightness guesses, or extra native framebuffer operations.
- // This hook is installed only on the exact 24H232 donor with
- // -wex-tgl-edp-refdiag; the old -wex-tgl-displaywake-pwm is inert.
+// Start a fresh AUX diagnostic epoch before the 24H232 donor handles FB0
+// Doze-to-Wake. The donor still owns the framebuffer power transition.
+uint32_t XE::wrapTGLFramebufferWakeEpoch(IOService *fb,uint32_t requested) {
  auto self=callbackXE;
  if(self && self->tglEDPRefDiagRequested && fb && requested==2 &&
     fb->getMetaClass()->getClassSize()>=0x4B90) {
@@ -14325,7 +14316,7 @@ uint32_t XE::wrapTGLDisplayWakePWM(IOService *fb,uint32_t requested) {
    IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
   }
  }
- return FunctionCast(wrapTGLDisplayWakePWM,self->orgTGLDisplayWakePWM)(fb,requested);
+ return FunctionCast(wrapTGLFramebufferWakeEpoch,self->orgTGLFramebufferWakeEpoch)(fb,requested);
 }
 
 bool XE::wrapTGLPanelPowerProperty(IORegistryEntry *framebuffer, const char *, OSObject *value) {
@@ -20062,28 +20053,6 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 	tglEDPAUXNativeMMIORecord(access,reg,true,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
 	tglEDPPanelNativeMMIORecord(access,reg,true,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
 	FunctionCast(wrapTGLRegisterWrite, callbackXE->orgTGLRegisterWrite)(access, reg, value);
- // Keep the independent native PWM control writes; after a failed wake,
- // comparing these with duty receipts shows which write occurred last.
- // The native caller owns the power gate; IORegistry never reads MMIO.
- if(callbackXE->tglActive && callbackXE->tglDisplayWakePWMRouteReady &&
-    callbackXE->xeProfile.family==XELP::Family::TigerLake &&
-    reg==0xC8250 && callbackXE->orgTGLRegisterRead) {
-  auto ctl=static_cast<uint8_t *>(callbackXE->tglObservationController);
-  if(ctl && access && *reinterpret_cast<void **>(ctl+0xC40)==access) {
-   const auto read=FunctionCast(wrapTGLRegisterRead,callbackXE->orgTGLRegisterRead);
-   static uint32_t count;
-   const auto seq=__sync_add_and_fetch(&count,1);
-   auto fb=*reinterpret_cast<IOService **>(ctl+0xD60);
-   const bool fbid=fb && fb->getMetaClass()->getClassSize()>=0x4B90 &&
-      *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(fb)+0x1D0)==ctl;
-   uint32_t receipt[] {1,seq,value,read(access,0xC8250),
-    read(access,0xC8254),read(access,0xC8258),
-    fbid?*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284):UINT32_MAX,
-    *reinterpret_cast<uint32_t *>(ctl+0xE58)};
-   char key[32];snprintf(key,sizeof(key),"TGLPWMControl%u",seq%48U);
-   IORegistryEntry::getRegistryRoot()->setProperty(key,receipt,sizeof(receipt));
-  }
- }
  // Sample PWM only at a native duty write while its caller owns power.
  // IORegistry reads consume this receipt; they never touch live MMIO.
  if(callbackXE->tglActive && reg==0xC8258 && callbackXE->orgTGLRegisterRead) {
@@ -20094,37 +20063,6 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
    uint32_t receipt[]={1,__sync_add_and_fetch(&count,1),value,
     read(access,0xC8250),read(access,0xC8254),read(access,0xC8258)};
    IORegistryEntry::getRegistryRoot()->setProperty("TGLBacklightPWM",receipt,sizeof(receipt));
-   // The donor writes a POSITIVE duty under its native register lock.
-   // Remember this proven level while FB0 is awake, before a later display
-   // fade can zero both the PWM duty and controller+0xE58 cached brightness.
-   if(callbackXE->tglDisplayWakePWMRouteReady &&
-      callbackXE->xeProfile.family==XELP::Family::TigerLake) {
-    auto fb=*reinterpret_cast<IOService **>(ctl+0xD60);
-    const bool fbReady=fb && fb->getMetaClass()->getClassSize()>=0x4B90 &&
-      *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x1DC)==0 &&
-      *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)==2 &&
-      *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(fb)+0x1D0)==ctl;
-    auto &last=callbackXE->tglDisplayWakeLevel;
-    if(fbReady && (receipt[3]&TGLDisplayWakePWM::PWMEnable) &&
-       !(receipt[3]&~(TGLDisplayWakePWM::PWMEnable|TGLDisplayWakePWM::PWMPolarity)) &&
-       receipt[4] && receipt[4]!=UINT32_MAX &&
-       receipt[5] && receipt[5]<=receipt[4] && receipt[2]==receipt[5]) {
-     // Publish valid last: all fields are written before the release.
-     __atomic_store_n(&last.valid,false,__ATOMIC_RELEASE);
-     last.framebuffer=fb;last.controller=ctl;
-     last.period=receipt[4];last.duty=receipt[5];
-     __atomic_store_n(&last.valid,true,__ATOMIC_RELEASE);
-    }
-    // Keep a bounded trace of native duty writes, including ZERO writes,
-    // to determine whether a delayed fade runs after frame wake.
-    uint32_t trace[] {1,receipt[1],receipt[2],receipt[3],receipt[4],
-     receipt[5],fbReady?*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284):UINT32_MAX,
-     *reinterpret_cast<uint32_t *>(ctl+0xE58),
-     static_cast<uint32_t>(__atomic_load_n(&last.valid,__ATOMIC_ACQUIRE)),
-     last.duty};
-    char key[32];snprintf(key,sizeof(key),"TGLPWMWrite%u",receipt[1]%48U);
-    IORegistryEntry::getRegistryRoot()->setProperty(key,trace,sizeof(trace));
-   }
   }
  }
  if(trace)tglTransitionRecord(36,true,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);

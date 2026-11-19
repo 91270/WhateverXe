@@ -14,16 +14,15 @@ body=re.search(r"constexpr size_t tglEDPPanelSlots=6;.*?(?=static void tglEDPAUX
 aux=re.search(r"static void tglEDPAUXNativeMMIORecord\(.*?\n\}",src,re.S)
 first=re.search(r"struct TGLAUXFirstCommandWitness \{.*?(?=static bool tglEDPAUXNativeMMIOSerialize)",src,re.S)
 state=re.search(r"// Sticky first-AUX command identity.*?\nstatic uint32_t tglEDPAUXRecentData1Count\{\};",src,re.S)
+marker=re.search(r"uint32_t XE::wrapTGLFramebufferWakeEpoch\(.*?\n\}",src,re.S)
 assert first and state
-assert header and body and aux
+assert header and body and aux and marker
 for check in (
     "tglEDPPanelNativeMMIORecord(access,reg,false,value,",
     "tglEDPPanelNativeMMIORecord(access,reg,true,value,",
     "WhateverXeEDPPanelNativeMMIO",
     "WhateverXeEDPPanelPreAUX",
-    "tglEDPPanelMMIOEpochCount=0;",
-    "bzero(tglEDPPanelLatest,sizeof(tglEDPPanelLatest));",
-    "tglEDPPanelFirstAUXNS=0;",
+    "route(symbol,wrapTGLFramebufferWakeEpoch,orgTGLFramebufferWakeEpoch)",
 ):
     assert check in src,check
 
@@ -74,6 +73,31 @@ static uint32_t tglEDPAUXMMIOCount{},tglEDPAUXMMIOEpochCount{};
 ///PRODUCTION_PANEL
 ///PRODUCTION_AUX
 ///PRODUCTION_FIRST
+struct IOService {
+  alignas(8) uint8_t storage[0x4B90]{};
+  struct MetaClass {
+    size_t size=0x4B90;
+    size_t getClassSize() const {return size;}
+  } meta;
+  const MetaClass *getMetaClass() const {return &meta;}
+};
+struct XE {
+  bool tglEDPRefDiagRequested=true;
+  uint32_t (*orgTGLFramebufferWakeEpoch)(IOService *,uint32_t)=nullptr;
+  static uint32_t wrapTGLFramebufferWakeEpoch(IOService *,uint32_t);
+};
+struct {uint32_t word[28];} tglEDPAUXFirstFailure{};
+uint32_t expectedEpoch,expectedRequest,nativeCalls;
+IOService framebuffer;
+uint32_t nativePowerState(IOService *fb,uint32_t requested) {
+  assert(fb==&framebuffer && requested==expectedRequest && !locked);
+  assert(tglEDPAUXWakeEpoch==expectedEpoch);
+  ++nativeCalls;
+  return 0xE00002BC;
+}
+XE observer{true,nativePowerState},*callbackXE=&observer;
+#define FunctionCast(method, native) (native)
+///PRODUCTION_MARKER
 alignas(8) uint8_t controller[0xC80]{};
 int fakeAccess1=7, fakeAccess2=8;
 void *access=&fakeAccess1;
@@ -103,22 +127,20 @@ TGLPanelPreAUXWitness pre() {
   memcpy(&out,a.bytes.data(),sizeof(out));
   return out;
 }
+void powerTransition(uint32_t prior,uint32_t requested,uint32_t index,uint32_t epoch) {
+  memcpy(framebuffer.storage+0x4284,&prior,sizeof(prior));
+  memcpy(framebuffer.storage+0x1DC,&index,sizeof(index));
+  expectedEpoch=epoch;
+  expectedRequest=requested;
+  const auto before=nativeCalls;
+  assert(XE::wrapTGLFramebufferWakeEpoch(&framebuffer,requested)==0xE00002BC);
+  assert(nativeCalls==before+1);
+}
 void freshWake() {
-  ++tglEDPAUXWakeEpoch;
-  tglEDPAUXMMIOEpochCount=0;
-  bzero(tglEDPAUXMMIOFirst,sizeof(tglEDPAUXMMIOFirst));
-  tglEDPPanelMMIOEpochCount=0;
-  bzero(tglEDPPanelMMIOFirst,sizeof(tglEDPPanelMMIOFirst));
-  bzero(tglEDPPanelLatest,sizeof(tglEDPPanelLatest));
-  bzero(tglEDPPanelPreAUX,sizeof(tglEDPPanelPreAUX));
-  tglEDPPanelPreAUXValid=0;
-  tglEDPPanelFirstAUXEpoch=0;
-  tglEDPPanelFirstAUXSeq=0;
-  tglEDPPanelFirstAUXNS=0;
-  bzero(tglEDPAUXRecentData1,sizeof(tglEDPAUXRecentData1));
-  tglEDPAUXRecentData1Count=0;
-  tglEDPAUXFirstCtl={};
-  tglEDPAUXFirstData1={};
+  // The next FB0 Doze-to-Wake transition must discard a previously saved failure.
+  tglEDPAUXFirstFailure.word[0]=7;
+  powerTransition(1,2,0,tglEDPAUXWakeEpoch+1);
+  assert(tglEDPAUXFirstFailure.word[0]==0);
 }
 int main() {
   *reinterpret_cast<void**>(controller+0xC40)=access;
@@ -129,6 +151,16 @@ int main() {
   putRead(0xDEAD,777);
   tglEDPPanelNativeMMIORecord(&fakeAccess2,0xC7200,false,8,nullptr,true,controller);
   assert(tglEDPPanelMMIOCount==0);
+  // Other framebuffer transitions retain the current epoch and still delegate.
+  powerTransition(0,2,0,0); // Full system sleep.
+  powerTransition(2,1,0,0); // Entering Doze.
+  powerTransition(1,2,1,0); // Another framebuffer.
+  observer.tglEDPRefDiagRequested=false;
+  powerTransition(1,2,0,0);
+  observer.tglEDPRefDiagRequested=true;
+  framebuffer.meta.size=0x4000;
+  powerTransition(1,2,0,0);
+  framebuffer.meta.size=0x4B90;
   freshWake();assert(tglEDPAUXWakeEpoch==1);
   putRead(0xC7200,0x80000000);
   putWrite(0xC7204,0x00000008); // Request, not committed ACK.
@@ -221,10 +253,10 @@ int main() {
   assert(firstCmd.epoch==5 && firstCmd.auxValid==1 && firstCmd.dataValid==0);
 
   assert(!locked);
-  std::puts("PASS: production PPS/HPD recorder & serialization, first AUX latch, absent-value semantics, independent ring, wrong-access guards, failure cleanup, epoch reset");
+  std::puts("PASS: framebuffer epoch and native delegation, PPS/HPD recorder and serialization, first AUX latch, independent rings, failure cleanup");
 }
 """
-out=(fixture.replace("///PRODUCTION_TYPE",header.group()).replace("///PRODUCTION_STATE",state.group()).replace("///PRODUCTION_PANEL",body.group()).replace("///PRODUCTION_AUX",aux.group()).replace("///PRODUCTION_FIRST",first.group()))
+out=(fixture.replace("///PRODUCTION_TYPE",header.group()).replace("///PRODUCTION_STATE",state.group()).replace("///PRODUCTION_PANEL",body.group()).replace("///PRODUCTION_AUX",aux.group()).replace("///PRODUCTION_FIRST",first.group()).replace("///PRODUCTION_MARKER",marker.group()))
 assert "///PRODUCTION" not in out
 with tempfile.TemporaryDirectory(prefix="tgl-edp-panel-observer-") as tmp:
     p=Path(tmp)

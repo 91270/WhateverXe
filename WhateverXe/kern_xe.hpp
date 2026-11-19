@@ -30,7 +30,6 @@
 #include "kern_vbt.hpp"
 #include "kern_alderlake_s.hpp"
 #include "kern_xelp_panel_pwm.hpp"
-#include "kern_tgl_display_wake_pwm.hpp"
 #include "kern_xelp_donor.hpp"
 #include "kern_xelp_display_contract.hpp"
 #include "kern_xelp_link_requirements.hpp"
@@ -123,15 +122,8 @@ private:
     bool adlsPLLTableReady {},adlsClockReady {},adlsPowerReady {},adlsPanelPWMReady {};
  XELP::PanelPWM adlsPanelPWM;
  mach_vm_address_t orgADLSLightUpEDP {},orgADLSPanelBacklight {};
- // Opt-in TGL-only display-doze wake PWM repair, independent of CSB/system sleep.
- bool tglDisplayWakePWMRouteReady {};
- // Valid only for one native framebuffer display Doze epoch; never system sleep.
- struct TGLDisplayWakeLevel {
-  IOService *framebuffer {};void *controller {};
-  uint32_t period {},duty {};bool valid {};
- } tglDisplayWakeLevel;
- mach_vm_address_t orgTGLDisplayWakePWM {};
- static uint32_t wrapTGLDisplayWakePWM(IOService *framebuffer,uint32_t requested);
+ mach_vm_address_t orgTGLFramebufferWakeEpoch {};
+ static uint32_t wrapTGLFramebufferWakeEpoch(IOService *framebuffer,uint32_t requested);
 
  static bool adlsPanelPWMTarget(void *controller,void *&access,void *&power);
  static bool adlsCapturePanelPWM(void *controller);
