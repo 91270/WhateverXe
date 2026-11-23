@@ -26,10 +26,16 @@ assert not (repo/"WhateverXe/kern_tgl_display_wake_pwm.hpp").exists()
 assert not (repo/"tests/tgl_display_wake_pwm.cpp").exists()
 assert "getPG(" not in wake and "write(" not in wake and "read(" not in wake
 assert "FunctionCast(wrapTGLFramebufferWakeEpoch" in wake
+# Source contract: opt-in first-AUX snapshots, no continuous PPS/HPD ring and
+# no implicit ComboClock stage trace just because refdiag is active.
+assert "tglEDPPanelMMIOFirst" not in src
+assert "tglEDPPanelMMIOLast" not in src
+assert "tglEDPPanelNativeMMIOSerialize" not in src
+assert "tglInitTransitionTrace(tglDisplayTraceEnabled)" in src
+assert "TGLComboClockTraceReady" not in src
 for check in (
     "tglEDPPanelNativeMMIORecord(access,reg,false,value,",
     "tglEDPPanelNativeMMIORecord(access,reg,true,value,",
-    "WhateverXeEDPPanelNativeMMIO",
     "WhateverXeEDPPanelPreAUX",
     "route(symbol,wrapTGLFramebufferWakeEpoch,orgTGLFramebufferWakeEpoch)",
 ):
@@ -197,32 +203,18 @@ int main() {
   assert(frozen.validMask==0x1f && frozen.last[0].word[4]==0x80000000);
   assert(frozen.last[5].word[0]==0 && frozen.auxSequence==snap.auxSequence);
   assert(tglEDPPanelMMIOCount==7);
-  // Separate ring has 64 first samples and 128 most recent; AUX storm cannot evict.
+  // No continuous PPS/HPD ring: only the immutable pre-SEND snapshot.
   for(unsigned i=0;i<350;++i)firstAUX();
   assert(tglEDPPanelMMIOCount==7 && tglEDPAUXMMIOCount==704);
-  assert(tglEDPAUXMMIOFirst[0].word[3]==0x64014 && tglEDPAUXMMIOFirst[0].word[4]==0x91020200);
-  assert(tglEDPAUXMMIOFirst[1].word[3]==0x64010 && tglEDPAUXMMIOFirst[1].word[4]==0x8c60023f);
+  assert(tglEDPAUXMMIOFirst[0].word[3]==0x64014 && tglEDPAUXMMIOFirst[1].word[3]==0x64010);
   firstCmd=firstCommand();
   assert(firstCmd.epoch==1 && firstCmd.auxValid && firstCmd.dataValid);
   assert(firstCmd.data1.word[0]==1 && firstCmd.auxCtl.word[0]==2);
   for(unsigned i=0;i<190;++i)putRead(0xC7200,i);
-  OSSerialize out;
-  assert(tglEDPPanelNativeMMIOSerialize(nullptr,nullptr,&out));
-  assert(out.bytes.size()==16+(64+128)*sizeof(TGLAUXNativeMMIO));
-  uint32_t words[4];memcpy(words,out.bytes.data(),16);
-  assert(words[0]==1 && words[1]==197 && words[2]==64 && words[3]==48);
-  TGLAUXNativeMMIO firstEntry{};
-  memcpy(&firstEntry,out.bytes.data()+16,48);
-  assert(firstEntry.word[0]==1 && firstEntry.word[3]==0xC7200);
-  TGLAUXNativeMMIO latest{};
-  const uint32_t finalSeq=tglEDPPanelMMIOCount;
-  const size_t ringOffset=16+64*48+((finalSeq-1)%128)*48;
-  memcpy(&latest,out.bytes.data()+ringOffset,48);
-  assert(latest.word[0]==finalSeq && latest.word[4]==189);
+  assert(tglEDPPanelMMIOCount==197);
   assert(pre().last[0].word[4]==0x80000000);
-  failAlloc=true;assert(!tglEDPPanelNativeMMIOSerialize(nullptr,nullptr,&out));failAlloc=false;
+  OSSerialize out;
   failData=true;
-  assert(!tglEDPPanelNativeMMIOSerialize(nullptr,nullptr,&out));
   assert(!tglEDPPanelPreAUXSerialize(nullptr,nullptr,&out));
   assert(!tglEDPAUXFirstCommandSerialize(nullptr,nullptr,&out));
   failData=false;
@@ -300,8 +292,17 @@ int main() {
   assert(tglEDPAUXMMIOCount==countBeforeCustom+8);
   assert(tglEDPAUXMMIOFirst[4].word[4]==0x44);
 
+  // Exact Apple donor clamps requested>2 to Wake=2 before native dispatch.
+  // A Doze -> invalid-high request still marks a new first-AUX epoch; WEX
+  // passes the original argument to Apple unmodified.
+  powerTransition(1,3,0,tglEDPAUXWakeEpoch+1);
+  assert(tglEDPAUXWakeEpoch==customEpoch+1);
+  firstAUX();
+  assert(firstCommand().epoch==tglEDPAUXWakeEpoch);
+  assert(pre().epoch==tglEDPAUXWakeEpoch);
+
   assert(!locked);
-  std::puts("PASS: framebuffer epoch and native delegation, passive native Custom AUX/DC6 receipts, PPS/HPD recorder and serialization, first AUX latch, independent rings, failure cleanup");
+  std::puts("PASS: framebuffer epoch and native delegation, passive native Custom AUX/DC6 receipts, first-AUX PPS/HPD snapshot and serialization, no PPS event ring, failure cleanup");
 }
 """
 out=(fixture.replace("///PRODUCTION_TYPE",header.group()).replace("///PRODUCTION_STATE",state.group()).replace("///PRODUCTION_PANEL",body.group()).replace("///PRODUCTION_AUX",aux.group()).replace("///PRODUCTION_FIRST",first.group()).replace("///PRODUCTION_MARKER",marker.group()))

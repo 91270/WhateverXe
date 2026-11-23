@@ -3431,7 +3431,7 @@ static int tglEDPPanelRegisterSlot(unsigned long reg) {
   default: return -1;
  }
 }
-static TGLAUXNativeMMIO tglEDPPanelMMIOFirst[64]{},tglEDPPanelMMIOLast[128]{};
+// Keep last native receipt for each PPS/HPD register; freeze it at first AUX SEND.
 static TGLAUXNativeMMIO tglEDPPanelLatest[tglEDPPanelSlots]{};
 static TGLAUXNativeMMIO tglEDPPanelPreAUX[tglEDPPanelSlots]{};
 static uint32_t tglEDPPanelMMIOCount{},tglEDPPanelMMIOEpochCount{};
@@ -3457,28 +3457,7 @@ static void tglEDPPanelNativeMMIORecord(void *access,unsigned long reg,bool writ
  receipt.word[5]=tglConnectionCaller(returnAddress);
  receipt.word[6]=++tglEDPPanelMMIOEpochCount;
  tglEDPPanelLatest[slot]=receipt;
- if(receipt.word[6]<=arrsize(tglEDPPanelMMIOFirst))
-   tglEDPPanelMMIOFirst[receipt.word[6]-1]=receipt;
- tglEDPPanelMMIOLast[(receipt.word[0]-1)%arrsize(tglEDPPanelMMIOLast)]=receipt;
  IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
-}
-static bool tglEDPPanelNativeMMIOSerialize(void *,void *,OSSerialize *serializer) {
- if(!tglAUXLock)return false;
- constexpr size_t firstSize=sizeof(tglEDPPanelMMIOFirst);
- constexpr size_t lastSize=sizeof(tglEDPPanelMMIOLast);
- auto raw=static_cast<uint8_t *>(IOMalloc(16+firstSize+lastSize));
- if(!raw)return false;
- auto h=reinterpret_cast<uint32_t *>(raw);
- h[0]=1;h[2]=64;h[3]=sizeof(TGLAUXNativeMMIO);
- const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
- h[1]=tglEDPPanelMMIOCount;
- memcpy(raw+16,tglEDPPanelMMIOFirst,firstSize);
- memcpy(raw+16+firstSize,tglEDPPanelMMIOLast,lastSize);
- IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
- auto data=OSData::withBytes(raw,16+firstSize+lastSize);
- IOFree(raw,16+firstSize+lastSize);
- if(!data)return false;
- const bool ok=data->serialize(serializer);data->release();return ok;
 }
 struct TGLPanelPreAUXWitness {
  uint32_t version,epoch,auxEpoch,auxSequence,validMask,slots,itemSize,reserved;
@@ -14149,9 +14128,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				tglEDPRefDiagRequested=tglAUXParentReady &&
 					XELP::displayAdapter(xeProfile.family)==XELP::DisplayAdapter::TGL &&
 					checkKernelArgument("-wex-tgl-edp-refdiag");
-				tglInitTransitionTrace(tglDisplayTraceEnabled || tglEDPRefDiagRequested);
-                IORegistryEntry::getRegistryRoot()->setProperty(
-                    "TGLComboClockTraceReady",tglEDPRefDiagRequested && tglTransitionLock);
+				tglInitTransitionTrace(tglDisplayTraceEnabled);
                 IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPRefDiagReady",tglEDPRefDiagRequested);
 				patcher.clearError();
 			}
@@ -14856,7 +14833,9 @@ void XE::wrapADLSPanelPWMEnable(void *access) {
 // Doze-to-Wake. The donor still owns the framebuffer power transition.
 uint32_t XE::wrapTGLFramebufferWakeEpoch(IOService *fb,uint32_t requested) {
  auto self=callbackXE;
- if(self && self->tglEDPRefDiagRequested && fb && requested==2 &&
+ // The matched native donor clamps requested states above 2 to Wake (2)
+ // before comparing its current state and dispatching the real transition.
+ if(self && self->tglEDPRefDiagRequested && fb && requested>=2 &&
     fb->getMetaClass()->getClassSize()>=0x4B90) {
   auto b=reinterpret_cast<const uint8_t *>(fb);
   if(*reinterpret_cast<const uint32_t *>(b+0x1DC)==0 &&
@@ -14866,7 +14845,6 @@ uint32_t XE::wrapTGLFramebufferWakeEpoch(IOService *fb,uint32_t requested) {
    tglEDPAUXMMIOEpochCount=0;
    bzero(tglEDPAUXMMIOFirst,sizeof(tglEDPAUXMMIOFirst));
    tglEDPPanelMMIOEpochCount=0;
-   bzero(tglEDPPanelMMIOFirst,sizeof(tglEDPPanelMMIOFirst));
    bzero(tglEDPPanelLatest,sizeof(tglEDPPanelLatest));
    bzero(tglEDPPanelPreAUX,sizeof(tglEDPPanelPreAUX));
    tglEDPPanelPreAUXValid=0;
@@ -15176,9 +15154,6 @@ bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
   }
   if(auto live=OSSerializer::forTarget(nullptr,tglEDPAUXFirstCommandSerialize)) {
    IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPAUXFirstCommand",live);live->release();
-  }
-  if(auto live=OSSerializer::forTarget(nullptr,tglEDPPanelNativeMMIOSerialize)) {
-   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPPanelNativeMMIO",live);live->release();
   }
   if(auto live=OSSerializer::forTarget(nullptr,tglEDPPanelPreAUXSerialize)) {
    IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPPanelPreAUX",live);live->release();
@@ -20029,26 +20004,9 @@ volatile uint8_t *XE::tglClockOrderTarget(void *controller, void *port, void *pa
 void XE::wrapTGLDisableClocks(void *controller, void *port, void *otherPort) {
  auto config=port?*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port)+0x548):nullptr;
  const bool combo=callbackXE->adlsDisplaySelected || (config && config[0]<2);
- const uint32_t ddi=config?config[0]:UINT32_MAX;
  bool keepPLL=false;
- if(combo) {
-  tglTransitionRecord(130,false,port,ddi,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(otherPort));
-  uint32_t targetReason=0,targetDetail=0;
-  const bool target=comboClockTarget(controller,port,otherPort,&targetReason,&targetDetail);
-  tglTransitionRecord(131,true,port,ddi,target,targetReason,&targetDetail,sizeof(targetDetail));
-  if(!target) {
-   IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockDisableRejected",true);
-   return;
-  }
-  uint32_t beginReason=0,beginDetail=0;
-  const bool begun=comboBeginClock(controller,port,false,keepPLL,nullptr,&beginReason,&beginDetail);
-  tglTransitionRecord(132,true,port,ddi,begun,beginReason,&beginDetail,sizeof(beginDetail));
-  if(!begun) {
-   IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockDisableRejected",true);return;
-  }
- } else {
-  const uint32_t bypassReason=config?1U:2U;
-  tglTransitionRecord(136,false,port,ddi,bypassReason,reinterpret_cast<uintptr_t>(otherPort));
+ if(combo && (!comboClockTarget(controller,port,otherPort) || !comboBeginClock(controller,port,false,keepPLL))) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockDisableRejected",true);return;
  }
  tglTransitionRecord(32,false,port,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(otherPort),0);
 	auto s = callbackXE;
@@ -20087,13 +20045,8 @@ void XE::wrapTGLDisableClocks(void *controller, void *port, void *otherPort) {
 	if (owned && tx.pending) { tx.pending = false; wrapTGLRegisterWrite(tx.access, tx.clockReg, tx.value); }
 	// The donor's self-sharing argument gates the output and releases its DDI
 	// reference, but leaves the shared PLL running and recalculates voltage.
- if(combo)tglTransitionRecord(133,false,port,ddi,reinterpret_cast<uintptr_t>(otherPort),keepPLL);
 	FunctionCast(wrapTGLDisableClocks, s->orgTGLDisableClocks)(controller, port, combo?(keepPLL?port:nullptr):otherPort);
- if(combo)tglTransitionRecord(134,true,port,ddi,reinterpret_cast<uintptr_t>(otherPort),keepPLL);
- if(combo) {
-  comboEndClock();
-  tglTransitionRecord(135,true,port,ddi,0,0);
- } else tglTransitionRecord(137,true,port,ddi,0,0);
+ if(combo)comboEndClock();
  tglTransitionRecord(32,true,port,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(otherPort),0);
 }
 
@@ -20129,56 +20082,21 @@ bool XE::adlsClockTarget(void *controller,void *port,void *otherPort) {
         *reinterpret_cast<uint32_t *>(access+0x60)>=0x1642C8;
 }
 
-bool XE::comboClockTarget(void *controller,void *port,void *otherPort,
-                          uint32_t *reason,uint32_t *detail) {
-    if(reason)*reason=0;
-    if(detail)*detail=0;
-    auto reject=[&](uint32_t code,uint32_t value=0U)->bool {
-        if(reason)*reason=code;
-        if(detail)*detail=value;
-        return false;
-    };
+bool XE::comboClockTarget(void *controller,void *port,void *otherPort) {
     auto s=callbackXE;
-    if(!s)return reject(1);
-    if(s->adlsDisplaySelected) {
-        const bool ok=adlsClockTarget(controller,port,otherPort);
-        return ok?true:reject(2);
-    }
-    if(!controller)return reject(3);
-    if(!port)return reject(4);
-    if(otherPort && otherPort!=port) {
-        uint32_t nestedReason=0,nestedDetail=0;
-        if(!comboClockTarget(controller,otherPort,nullptr,&nestedReason,&nestedDetail))
-            return reject(5,((nestedReason&0xffffU)<<16)|(nestedDetail&0xffffU));
-    }
+    if(s->adlsDisplaySelected)return adlsClockTarget(controller,port,otherPort);
+    if(!controller || !port || (otherPort && otherPort!=port && !comboClockTarget(controller,otherPort,nullptr)))return false;
     auto p=static_cast<uint8_t *>(port),c=static_cast<uint8_t *>(controller);
     auto config=*reinterpret_cast<uint32_t **>(p+0x548);
     auto access=*reinterpret_cast<uint8_t **>(c+0xC40);
-    if(!config)return reject(6);
-    if(config[0]>=2)return reject(7,config[0]);
-    if(config[3])return reject(8,config[3]);
-    if(config[2]>2)return reject(9,config[2]);
-    if(!access)return reject(10);
-    if(*reinterpret_cast<void **>(p+0x578)!=access)return reject(11);
-    const auto mapSize=*reinterpret_cast<uint32_t *>(access+0x60);
-    if(mapSize<0x164294)return reject(12,mapSize);
-    const auto expected=config[0]?0x6C10CU:0x16210CU;
-    const auto portRegister=*reinterpret_cast<uint32_t *>(p+0x5B8);
-    if(portRegister!=expected)return reject(13,portRegister);
-    if(s->display13FramebufferRequested) {
-        const bool owner=controller==s->adlnTopologyController;
-        const bool selected=owner && Display13FBTopology::selected(
-            s->adlnPlatform,config,s->adlnOutputWiring);
-        return selected?true:reject(14,owner?1U:0U);
-    }
-    if(!s->tglActive)return reject(15);
-    if(controller!=s->tglObservationController)return reject(16);
-    const auto adapter=XELP::displayAdapter(s->xeProfile.family);
-    if(adapter!=XELP::DisplayAdapter::TGL)return reject(17,static_cast<uint32_t>(adapter));
-    auto expectedConfig=reinterpret_cast<uint32_t *>(
-        reinterpret_cast<uint8_t *>(s->tglPlatformCopy)+0x20+24*config[0]);
-    if(config!=expectedConfig)return reject(18);
-    return true;
+    if(!config || config[0]>=2 || config[3] || config[2]>2 || !access || *reinterpret_cast<void **>(p+0x578)!=access ||
+       *reinterpret_cast<uint32_t *>(access+0x60)<0x164294 ||
+       *reinterpret_cast<uint32_t *>(p+0x5B8)!=(config[0]?0x6C10CU:0x16210CU))return false;
+    if(s->display13FramebufferRequested)return controller==s->adlnTopologyController &&
+        Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring);
+    return s->tglActive && controller==s->tglObservationController &&
+        XELP::displayAdapter(s->xeProfile.family)==XELP::DisplayAdapter::TGL &&
+        config==reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(s->tglPlatformCopy)+0x20+24*config[0]);
 }
 
 bool XE::comboClockPower(void *power,bool acquire) {
@@ -20199,41 +20117,21 @@ void XE::comboClockWrite(void *access,unsigned long reg,uint32_t value) {
         s->orgDisplay13GMBusWrite:s->orgTGLRegisterWrite)(access,reg,value);
 }
 
-bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,void *other,
-                         uint32_t *reason,uint32_t *detail) {
-    if(reason)*reason=0;
-    if(detail)*detail=0;
-    auto reject=[&](uint32_t code,uint32_t value=0U)->bool {
-        if(reason)*reason=code;
-        if(detail)*detail=value;
-        return false;
-    };
+bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,void *other) {
     auto s=callbackXE;auto &t=comboClockTransaction;
-    if(!s)return reject(1);
-    if(!controller)return reject(12);
     auto c=static_cast<uint8_t *>(controller);
     auto access=*reinterpret_cast<uint8_t **>(c+0xC40);
     auto power=*reinterpret_cast<uint8_t **>(c+0xC8);
-    uint32_t invalid=0;
-    if(!t.lock)invalid|=1U;
-    if(!power)invalid|=2U;
-    if(power && *reinterpret_cast<void **>(power+0x10)!=controller)invalid|=4U;
-    if(power && *reinterpret_cast<void **>(power+0x78)!=access)invalid|=8U;
-    if(!access)invalid|=16U;
-    else if(!*reinterpret_cast<void **>(access+0x50))invalid|=32U;
-    if(invalid)return reject(2,invalid);
+    if(!t.lock || !power || *reinterpret_cast<void **>(power+0x10)!=controller ||
+       *reinterpret_cast<void **>(power+0x78)!=access || !*reinterpret_cast<void **>(access+0x50))return false;
     IORecursiveLockLock(t.lock);
-    if(t.thread){IORecursiveLockUnlock(t.lock);return reject(3);}
-    if(!comboClockPower(power,true)){IORecursiveLockUnlock(t.lock);return reject(4);}
+    if(t.thread){IORecursiveLockUnlock(t.lock);return false;}
+    if(!comboClockPower(power,true)){IORecursiveLockUnlock(t.lock);return false;}
     // DISPLAY_CORE must remain referenced from peer scan through readback.
     const auto pw=comboClockRead(access,0x45404);
-    auto abort=[&](uint32_t code,uint32_t value)->bool {
-        comboClockPower(power,false);
-        IORecursiveLockUnlock(t.lock);
-        return reject(code,value);
-    };
-    if(pw==UINT32_MAX)return abort(5,pw);
-    if((pw&3)!=3)return abort(6,pw);
+    if(pw==UINT32_MAX || (pw&3)!=3) {
+        comboClockPower(power,false);IORecursiveLockUnlock(t.lock);return false;
+    }
     const auto ddi=(*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port)+0x548))[0];
     XELPComboClock::Port route(s->adlsDisplaySelected?(ddi?ddi-2:0):ddi);
     XELPComboClock::ClockSnapshot snapshot;
@@ -20243,6 +20141,9 @@ bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,v
     if(s->adlsDisplaySelected)snapshot.mux[1]=comboClockRead(access,0x1642BC);
     for(unsigned i=0;i<snapshot.pllCount();++i){XELPComboClock::PLL pll;XELPComboClock::PLL::resolve(i,pll);snapshot.enable[i]=comboClockRead(access,pll.enable);}
     if(s->display13FramebufferRequested && display13FBPower.transcoders.dsi0Pipe<3) {
+        // The adoption boundary installs the qualified source/power binding
+        // before any native clock client. Revalidate here under the shared
+        // clock mutex, then pin its PLL even when DDI_CLK_OFF_A is set.
         const auto &source=display13FBPower.bootDSI;
         struct IO {
             void *access;bool parked;
@@ -20257,21 +20158,21 @@ bool XE::comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,v
             io,source,t.allocation,owner,s->dsiRuntimePower.host) :
             (XELP::DSI::sourceUnchanged(io,source) &&
              t.allocation.retain(source.identity.phy,source.identity.pll,owner,snapshot));
-        if(source.identity.pipe!=display13FBPower.transcoders.dsi0Pipe)
-            return abort(7,source.identity.pipe);
-        if(!retained)return abort(8,source.identity.phy|(source.identity.pll<<8));
+        if(source.identity.pipe!=display13FBPower.transcoders.dsi0Pipe ||
+           !retained) {
+            comboClockPower(power,false);IORecursiveLockUnlock(t.lock);return false;
+        }
     }
     const auto otherConfig=other && other!=port ? *reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(other)+0x548):nullptr;
     const auto choice=enable && otherConfig ? t.allocation.share(XELPComboClock::Port(otherConfig[0]),snapshot):
         t.allocation.choose(route,snapshot,enable);
-    if(!choice.valid)return abort(9,route.phy&0xffU);
-    if(route.phy>=snapshot.slots())return abort(10,(route.phy&0xffU)|((snapshot.slots()&0xffU)<<8));
-    if(t.allocation.external[route.phy])return abort(11,route.phy);
+    if(!choice.valid || route.phy>=snapshot.slots() || t.allocation.external[route.phy]) {
+        comboClockPower(power,false);IORecursiveLockUnlock(t.lock);return false;
+    }
     if(enable)t.allocation.binding[route.phy]=choice.pll+1;
     t.translation={route.phy,choice.pll,enable};t.before=snapshot;
     t.access=access;t.power=power;t.keepPLL=keepPLL=choice.keepPLL;
     __atomic_store_n(&t.thread,reinterpret_cast<uintptr_t>(current_thread()),__ATOMIC_RELEASE);
-    if(detail)*detail=pw;
     return true;
 }
 
@@ -20303,32 +20204,15 @@ void XE::comboClockTranslateWrite(void *access,unsigned long &reg,uint32_t &valu
 
 void XE::wrapTGLComboEnableClocks(void *controller,void *port,void *other,uint32_t *params) {
     auto config=port?*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port)+0x548):nullptr;
-    const uint32_t ddi=config?config[0]:UINT32_MAX;
     if(config && config[0]<2) {
-        tglTransitionRecord(120,false,port,ddi,reinterpret_cast<uintptr_t>(controller),reinterpret_cast<uintptr_t>(other));
-        uint32_t targetReason=0,targetDetail=0;
-        const bool target=comboClockTarget(controller,port,other,&targetReason,&targetDetail);
-        tglTransitionRecord(121,true,port,ddi,target,targetReason,&targetDetail,sizeof(targetDetail));
-        if(!target) {
-            IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockEnableRejected",true);
-            tglTransitionRecord(122,true,port,ddi,0,targetReason,&targetDetail,sizeof(targetDetail));return;
-        }
-        bool keep=false;uint32_t beginReason=0,beginDetail=0;
-        const bool begun=comboBeginClock(controller,port,true,keep,other,&beginReason,&beginDetail);
-        tglTransitionRecord(123,true,port,ddi,begun,beginReason,&beginDetail,sizeof(beginDetail));
-        if(!begun) {
+        bool keep=false;
+        if(!comboClockTarget(controller,port,other) || !comboBeginClock(controller,port,true,keep,other)) {
             IORegistryEntry::getRegistryRoot()->setProperty("WEXComboClockEnableRejected",true);return;
         }
-        tglTransitionRecord(124,false,port,ddi,reinterpret_cast<uintptr_t>(other),keep);
         FunctionCast(wrapTGLComboEnableClocks,callbackXE->orgComboEnableClocks)(controller,port,other,params);
-        tglTransitionRecord(125,true,port,ddi,reinterpret_cast<uintptr_t>(other),keep);
-        comboEndClock();
-        tglTransitionRecord(126,true,port,ddi,0,0);return;
+        comboEndClock();return;
     }
-    const uint32_t bypassReason=config?1U:2U;
-    tglTransitionRecord(127,false,port,ddi,bypassReason,reinterpret_cast<uintptr_t>(other));
     FunctionCast(wrapTGLComboEnableClocks,callbackXE->orgComboEnableClocks)(controller,port,other,params);
-    tglTransitionRecord(128,true,port,ddi,bypassReason,0);
 }
 
 void XE::wrapADLSEnableClocks(void *controller,void *port,void *otherPort,uint32_t *params) {

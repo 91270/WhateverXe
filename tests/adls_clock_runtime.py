@@ -47,8 +47,7 @@ struct XE {
  static uint8_t *adlsPowerTarget(void *p){return p==power?power:nullptr;}
  static bool comboClockPower(void *p,bool on){if(on)getPG(p,1);else putPG(p,1);return true;}
  static uint32_t comboClockRead(void *a,unsigned long r){return readNative(a,r);}
- static bool comboBeginClock(void*,void*,bool,bool&,void *other=nullptr,
-                            uint32_t *reason=nullptr,uint32_t *detail=nullptr);
+ static bool comboBeginClock(void*,void*,bool,bool&,void *other=nullptr);
  static void comboEndClock();
 } xe,*callbackXE=&xe;
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)

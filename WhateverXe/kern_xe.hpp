@@ -141,14 +141,13 @@ private:
     mach_vm_address_t orgComboEnableClocks {};
     static bool adlsClockTarget(void *controller,void *port,void *otherPort);
     mach_vm_address_t framebufferClockImage {};
-    static bool comboClockTarget(void *,void *,void *,uint32_t *reason=nullptr,uint32_t *detail=nullptr);
+    static bool comboClockTarget(void *,void *,void *);
     static bool comboClockPower(void *,bool);
     static uint32_t comboClockRead(void *,unsigned long);
     static void comboClockWrite(void *,unsigned long,uint32_t);
     static void comboClockTranslateWrite(void *,unsigned long &,uint32_t &,uintptr_t);
     static void wrapTGLComboEnableClocks(void *,void *,void *,uint32_t *);
-    static bool comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,void *other=nullptr,
-                                uint32_t *reason=nullptr,uint32_t *detail=nullptr);
+    static bool comboBeginClock(void *controller,void *port,bool enable,bool &keepPLL,void *other=nullptr);
     static void comboEndClock();
     static void wrapADLSEnableClocks(void *controller,void *port,void *otherPort,uint32_t *params);
     mach_vm_address_t orgADLSPortInit {};

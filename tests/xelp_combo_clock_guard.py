@@ -17,7 +17,7 @@ struct XE {
  uint64_t tglPlatformCopy[0x1c0/sizeof(uint64_t)]{},adlnPlatform[0x1c0/sizeof(uint64_t)]{};
  Display13OutputWiring adlnOutputWiring;
  static bool adlsClockTarget(void*,void*,void*){return false;}
- static bool comboClockTarget(void*,void*,void*,uint32_t * = nullptr,uint32_t * = nullptr);
+ static bool comboClockTarget(void*,void*,void*);
 } state,*callbackXE=&state;
 FUNCTION
 alignas(8) uint8_t ctl[0xf00]{},ports[2][0x700]{},access[0x80]{};
