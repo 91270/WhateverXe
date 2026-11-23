@@ -16130,14 +16130,19 @@ struct TGLS0SleepRecord {
 };
 static TGLS0SleepRecord tglS0Sleep[6];
 static uint32_t tglS0Epoch {};
-static mach_vm_address_t tglS0OrgWillSleep {};
+static mach_vm_address_t tglS0OrgBridgeSystemWillSleep {};
+static mach_vm_address_t tglS0OrgDisableInterrupts {};
 static bool tglS0SleepHookRouted {};
+// The exactly qualified Graphics donor drains the event machine twice before it calls
+// IGInterruptBridge::disableInterrupts(), which itself uses SafeForceWake.
+// Capture at that native boundary while the bridge still owns the GPU, NOT
+// after IntelAccelerator::systemWillSleep() has quiesced the bridge.
+static void *tglS0CaptureAccelerator {};
+static uint32_t tglS0CaptureEpoch {};
 static uint32_t tglS0WakeTrace[6][13] {};
 static uint32_t tglS0WakeCount {};
 
-static void tglS0WrapWillSleep(void *accelerator) {
- reinterpret_cast<void (*)(void *)>(tglS0OrgWillSleep)(accelerator);
- const uint32_t epoch=__sync_add_and_fetch(&tglS0Epoch,1);
+static void tglS0CaptureBeforeIRQDisable(void *accelerator,uint32_t epoch) {
  for (unsigned i=0;i<arrsize(tglS0Sleep);++i) {
   auto &record=tglS0Sleep[i];auto &engine=tglCSBEngines[i];
   __atomic_store_n(&record.epoch,0U,__ATOMIC_RELEASE);
@@ -16158,6 +16163,46 @@ static void tglS0WrapWillSleep(void *accelerator) {
    record.slots[j]=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8);
   __atomic_store_n(&record.epoch,epoch,__ATOMIC_RELEASE);
  }
+}
+
+// This route is only installed with the explicitly opted-in S0 sleep
+// contract. A matching accelerator+epoch is armed around the native
+// systemWillSleep() call. Other disables always delegate untouched.
+static void tglS0WrapDisableInterrupts(void *bridge) {
+ auto accelerator=bridge
+    ? *reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10)
+    : nullptr;
+ auto expected=accelerator;
+ if(accelerator &&
+    __atomic_compare_exchange_n(&tglS0CaptureAccelerator,&expected,
+                                static_cast<void *>(nullptr),false,
+                                __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+  const auto epoch=__atomic_load_n(&tglS0CaptureEpoch,__ATOMIC_ACQUIRE);
+  if(epoch)tglS0CaptureBeforeIRQDisable(accelerator,epoch);
+ }
+ reinterpret_cast<void (*)(void *)>(tglS0OrgDisableInterrupts)(bridge);
+}
+
+static void tglS0WrapBridgeSystemWillSleep(void *bridge) {
+ const auto original=reinterpret_cast<void (*)(void *)>(tglS0OrgBridgeSystemWillSleep);
+ if(!tglS0SleepHookRouted || !bridge) {original(bridge);return;}
+ // Arm only once native IGInterruptBridge::systemWillSleep has actually
+ // entered. Earlier scheduler/purge activity may also call disableInterrupts
+ // and must NOT be mistaken for the final sleep bridge shutdown.
+ auto accelerator=*reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10);
+ if(!accelerator) {original(bridge);return;}
+ const auto epoch=__sync_add_and_fetch(&tglS0Epoch,1);
+ // An unmatched or skipped native IRQ disable means there is no valid
+ // snapshot: resetOnWake will choose full guarded CSB reinitialization.
+ for(auto &record:tglS0Sleep) {
+  __atomic_store_n(&record.epoch,0U,__ATOMIC_RELEASE);
+  record.before.valid=false;
+ }
+ __atomic_store_n(&tglS0CaptureEpoch,epoch,__ATOMIC_RELEASE);
+ __atomic_store_n(&tglS0CaptureAccelerator,accelerator,__ATOMIC_RELEASE);
+ original(bridge);
+ __atomic_store_n(&tglS0CaptureAccelerator,static_cast<void *>(nullptr),__ATOMIC_RELEASE);
+ __atomic_store_n(&tglS0CaptureEpoch,0U,__ATOMIC_RELEASE);
 }
 
 // Expose a fixed CPU-only receipt through a lazy IORegistry serializer, without
@@ -16347,17 +16392,32 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   if(modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
  }
  if (ok && checkKernelArgument("-wex-tgl-s0-csb-resync")) {
-  // Both path and address are qualified against the analyzed donor build.
-  const auto symbol="__ZN16IntelAccelerator15systemWillSleepEv";
-  const auto target=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
-  bool sleepOK=target==address+0x28916;
+  // Exact locally qualified AppleIntelTGLGraphics donor: accelerator sleep -> bridge
+  // systemWillSleep (armed here) -> finishAllStamps -> bridge disable -> finishAllStamps
+  // -> disableInterrupts.  Install both routes only after full preflight.
+  // Native IRQ shutdown is still the only code mutating the interrupt state.
+  const auto sleepSymbol="__ZN17IGInterruptBridge15systemWillSleepEv";
+  const auto irqSymbol="__ZN17IGInterruptBridge17disableInterruptsEv";
+  const uint8_t entry[] {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+  bool sleepOK=size>0x4AB1D &&
+   patcher.solveSymbol<mach_vm_address_t>(index,sleepSymbol,address,size)==address+0x4AB14 &&
+   patcher.solveSymbol<mach_vm_address_t>(index,irqSymbol,address,size)==address+0x4A778 &&
+   !memcmp(reinterpret_cast<void *>(address+0x4AB14),entry,sizeof(entry)) &&
+   !memcmp(reinterpret_cast<void *>(address+0x4A778),entry,sizeof(entry));
   patcher.clearError();
   if(sleepOK) {
-   KernelPatcher::RouteRequest route {symbol,tglS0WrapWillSleep,tglS0OrgWillSleep};
+   // If the next route fails, the preceding IRQ hook remains inert:
+   // it cannot match an armed accelerator and delegates to Apple.
+   KernelPatcher::RouteRequest route {irqSymbol,tglS0WrapDisableInterrupts,tglS0OrgDisableInterrupts};
    sleepOK=patcher.routeMultiple(index,&route,1,address,size);
    patcher.clearError();
   }
-  tglS0SleepHookRouted=sleepOK;
+  if(sleepOK) {
+   KernelPatcher::RouteRequest route {sleepSymbol,tglS0WrapBridgeSystemWillSleep,tglS0OrgBridgeSystemWillSleep};
+   sleepOK=patcher.routeMultiple(index,&route,1,address,size);
+   patcher.clearError();
+  }
+  __atomic_store_n(&tglS0SleepHookRouted,sleepOK,__ATOMIC_RELEASE);
   root->setProperty("TGLS0SleepHookRouted",sleepOK);
   if(sleepOK) {
    auto trace=OSSerializer::forTarget(nullptr,tglS0WakeTraceSerialize);

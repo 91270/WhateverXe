@@ -27,7 +27,10 @@ def body(marker):
 
 io = body("struct TGLCSBIO")
 streamer_init = body("bool XE::wrapTGLCSBInit(")
-sleep = body("static void tglS0WrapWillSleep(void *accelerator)")
+sleep = body("static void tglS0WrapBridgeSystemWillSleep(void *bridge)")
+snapshot = body("static void tglS0CaptureBeforeIRQDisable(void *accelerator,uint32_t epoch)")
+bridge = body("static void tglS0WrapDisableInterrupts(void *bridge)")
+installer = body("bool XE::installTGLCSB12(")
 wake = body("void XE::wrapTGLCSBWake(void *streamer)")
 reset = body("void XE::wrapTGLCSBReset(void *streamer)")
 process = body("void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags)")
@@ -43,7 +46,24 @@ checks = {
     "TGLCSBIO delegates tail selection to the shared production helper":
         "sampledTail=TGLCSB::readTail(*this)" in io,
     "sleep snapshot uses the selected HWSP/MMIO tail source":
-        "io.readTail()" in sleep and "io.hwsp+0xBC" not in sleep,
+        "io.readTail()" in snapshot and "io.hwsp+0xBC" not in snapshot,
+    "sleep wrapper no longer accesses GPU MMIO after native power quiesce":
+        "TGLCSBIO" not in sleep and "io.acquire()" not in sleep
+        and sleep.index("tglS0CaptureAccelerator,accelerator") < sleep.rindex("original(bridge);")
+        < sleep.index("tglS0CaptureAccelerator,static_cast<void *>(nullptr)"),
+    "snapshot occurs before native bridge IRQ disable, not after":
+        bridge.index("tglS0CaptureBeforeIRQDisable(accelerator,epoch)")
+        < bridge.index("tglS0OrgDisableInterrupts)(bridge)"),
+    "only native accelerator bridge disable can claim the one-shot snapshot":
+        "bridge)+0x10" in bridge
+        and "__atomic_compare_exchange_n(&tglS0CaptureAccelerator" in bridge
+        and "if(epoch)" in bridge,
+    "both original sleep and IRQ disable must be routed after exact donor checks":
+        installer.index('sleepSymbol="__ZN17IGInterruptBridge15systemWillSleepEv"')
+        < installer.index('irqSymbol="__ZN17IGInterruptBridge17disableInterruptsEv"')
+        < installer.index("patcher.routeMultiple(index,&route,1,address,size)")
+        and installer.index("patcher.routeMultiple(index,&route,1,address,size)")
+        < installer.index("tglS0SleepHookRouted,sleepOK"),
     "wake path uses the selected HWSP/MMIO tail source":
         "io.readTail()" in wake and "io.hwsp+0xBC" not in wake,
     "wake path uses the tested plan with last successful mode":

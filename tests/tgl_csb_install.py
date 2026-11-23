@@ -58,7 +58,9 @@ template<class T,size_t N> constexpr size_t arrsize(const T (&)[N]) {return N;}
 #define PANIC(...) throw std::runtime_error("fatal CSB12 incomplete installation")
 static bool tglCSB12Enabled=false;
 static bool tglS0SleepHookRouted=false;
-static mach_vm_address_t tglS0OrgWillSleep=0;
+static bool s0Requested=false;
+static mach_vm_address_t tglS0OrgBridgeSystemWillSleep=0;
+static mach_vm_address_t tglS0OrgDisableInterrupts=0;
 static mach_vm_address_t xelpRegularForceWakeOriginal=0;
 static void *currentGraphics=reinterpret_cast<void *>(1);
 
@@ -75,13 +77,14 @@ struct IORegistryEntry {
  std::unordered_map<std::string,bool> flags;
  void reset() {flags.clear();}
 };
-bool checkKernelArgument(const char *) {return false;}
+bool checkKernelArgument(const char *) {return s0Requested;}
 bool xelpForceWakeIRQSerialize(void *,void *,OSSerializer *) {return true;}
 bool tglCSBSerialize(void *,void *,OSSerializer *) {return true;}
 bool tglCSBModeSerialize(void *,void *,OSSerializer *) {return true;}
 bool tglS0WakeTraceSerialize(void *,void *,OSSerializer *) {return true;}
 void xelpRegularForceWakeProtected(void *,bool,unsigned) {}
-void tglS0WrapWillSleep(void *) {}
+void tglS0WrapBridgeSystemWillSleep(void *) {}
+void tglS0WrapDisableInterrupts(void *) {}
 using TGLCSBMethod=void (*)(void *,const void *);
 using TGLCSBForceWake=void (*)(void *,bool,unsigned);
 TGLCSBMethod tglCSBMethods[4]{};
@@ -111,6 +114,8 @@ struct KernelPatcher {
   {"__ZN16IntelAccelerator13SafeForceWakeEbj",0x28C2A},
   {"__ZN16IntelAccelerator22SafeForceWakeInterruptEbj",0x2DA26},
   {"__ZN16IntelAccelerator17initModeRegistersEv",0x28E1A},
+  {"__ZN17IGInterruptBridge15systemWillSleepEv",0x4AB14},
+  {"__ZN17IGInterruptBridge17disableInterruptsEv",0x4A778},
  };
  // Scenario: 0 = success; 1 = counted ForceWake hook failure;
  // 2...5 = Nth CSB route failure after earlier routes were applied;
@@ -121,7 +126,9 @@ struct KernelPatcher {
  // 10 = rollback fails and must trip fatal guard;
  // 11 = unrecognized donor code (fail without writing/rollback);
  // 12 = partially corrupted text patch (fatal: cannot restore safely);
- // 13 = rollback bytes restored, but Lilu reports failure (also fatal).
+ // 13 = rollback bytes restored, but Lilu reports failure (also fatal);
+ // 14 = S0 IRQ bridge hook route fails, 15 = S0 sleep hook route fails,
+ // 16 = S0 pair installs; all three leave core CSB12 transaction valid.
  int scenario=0;
  int csbRoutesInstalled=0, lookupCalls=0, restoreCalls=0;
  std::vector<std::string> operations;
@@ -138,7 +145,18 @@ struct KernelPatcher {
   return true;
  }
  bool routeMultiple(size_t,RouteRequest *req,size_t n,mach_vm_address_t,size_t) {
-  if(n==1) {operations.emplace_back("sleepRoute");return true;}
+  if(n==1) {
+    const std::string symbol=req[0].symbol;
+    if(symbol.find("disableInterrupts")!=std::string::npos) {
+     operations.emplace_back("irqSleepRoute");
+     if(scenario==14)return false;
+    } else {
+     operations.emplace_back("sleepRoute");
+     if(scenario==15)return false;
+    }
+    if(req[0].org)*req[0].org=0xABCDEF;
+    return true;
+  }
   assert(n==4);operations.emplace_back("csbRoute");
   for(size_t i=0;i<n;++i) {
    if(scenario>=2 && scenario<=5 && int(i)+2==scenario) return false;
@@ -190,15 +208,19 @@ int main() {
  const std::array<uint8_t,11> resetFind {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
  const std::array<uint8_t,11> resetReplace {0xB8,11,0,0,0,0x89,0x87,4,0x1C,0,0};
  const std::array<uint8_t,14> wakeEntry {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
- for(int scenario=0;scenario<=13;++scenario) {
+ for(int scenario=0;scenario<=16;++scenario) {
+  s0Requested=scenario>=14;
   tglCSB12Enabled=false;
   tglS0SleepHookRouted=false;
   IORegistryEntry::getRegistryRoot()->reset();
   XE driver;KernelPatcher patcher;patcher.scenario=scenario;
-  std::vector<uint8_t> image(0x3E000,0);
+  std::vector<uint8_t> image(0x4B000,0);
   auto base=reinterpret_cast<uintptr_t>(image.data());
   std::memcpy(image.data()+0x28C2A,wakeEntry.data(),wakeEntry.size());
   std::memcpy(image.data()+0x3A396,wakeEntry.data(),wakeEntry.size());
+  const std::array<uint8_t,9> sleepEntry {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+  std::memcpy(image.data()+0x4AB14,sleepEntry.data(),sleepEntry.size());
+  std::memcpy(image.data()+0x4A778,sleepEntry.data(),sleepEntry.size());
   image[0x28C9A]=0xE8;image[0x28E14]=0xE9;
   std::memcpy(image.data()+0x28E45,modeFind.data(),modeFind.size());
   std::memcpy(image.data()+0x3A3A4,resetFind.data(),resetFind.size());
@@ -215,6 +237,12 @@ int main() {
     assert(patcher.csbRoutesInstalled==4 && patcher.lookupCalls==2);
     assert(patcher.operations.end()!=std::find(patcher.operations.begin(),patcher.operations.end(),"csbRoute"));
     std::cout<<"PASS successful commit of exact production installer\n";
+  } else if(scenario>=14) {
+    assert(ok && tglCSB12Enabled && !panicked);
+    assert(tglS0SleepHookRouted==(scenario==16));
+    assert(check(0x28E45,modeReplace) && check(0x3A3A4,resetReplace));
+    std::cout<<"PASS S0 opt-in route transaction "<<scenario
+             <<", snapshotHookReady="<<tglS0SleepHookRouted<<"\n";
   } else if(scenario==10 || scenario==12 || scenario==13) {
     assert(panicked);
     std::cout<<"PASS irreversible/partial text failure is fatal (no false success)\n";
