@@ -210,6 +210,11 @@ inline Handler handlerFor(const Event &event) {
 }
 
 enum class Error : uint8_t { None, NotInitialized, InvalidPointer, Unavailable, Rejected };
+// Native submitExecList returns void: an unready CSB12 queue has no valid
+// completion/error path at this call boundary, so it must not be submitted.
+constexpr bool canSubmit(bool hardwareReady, Error error) {
+    return hardwareReady && error == Error::None;
+}
 enum class Source : uint8_t { HWSP, RetriedHWSP, MMIO };
 
 struct Sample {

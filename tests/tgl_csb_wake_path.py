@@ -29,6 +29,8 @@ io = body("struct TGLCSBIO")
 streamer_init = body("bool XE::wrapTGLCSBInit(")
 sleep = body("static void tglS0WrapWillSleep(void *accelerator)")
 wake = body("void XE::wrapTGLCSBWake(void *streamer)")
+reset = body("void XE::wrapTGLCSBReset(void *streamer)")
+process = body("void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags)")
 initialize = body("void tglCSBInitialize(void *streamer,uint32_t flags=0)")
 submit = body("void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags)")
 
@@ -65,6 +67,14 @@ checks = {
         < initialize.index("engine.modeAtInit=mode"),
     "submit retry goes through the guarded shared initializer":
         "if (!e.hardwareReady) tglCSBInitialize(streamer,flags)" in submit,
+    "failed mode/queue admission blocks native submit (never drop stamp silently)":
+        submit.index("if (!TGLCSB::canSubmit(e.hardwareReady,e.state.error))")
+        < submit.index("orgTGLHostSubmit)(streamer,flags)"),
+    "GPU reset blocks failed CSB12 mode before native processGPUReset resubmits":
+        reset.index("if (!TGLCSB::canSubmit(engine.hardwareReady,engine.state.error))")
+        < reset.rindex("orgTGLCSBReset)(streamer)"),
+    "partially installed CSB hooks fall back to original native implementations":
+        all("if (!tglCSB12Enabled)" in v for v in (streamer_init,wake,reset,process)),
     "only the guarded initializer invokes the 12-entry reset":
         text.count("TGLCSB::initialize(engine.state,io)") == 1,
     "unverified wake mode blocks immediate 12-entry initialization":

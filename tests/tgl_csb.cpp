@@ -90,6 +90,13 @@ static void wakeTailSourceTests() {
 }
 
 static void wakeTests() {
+    // A failed 12-entry mode guard must never be treated as a valid
+    // native void submit or GPU-reset resubmission.
+    assert(canSubmit(true,Error::None));
+    assert(!canSubmit(false,Error::None));
+    for(auto error : {Error::NotInitialized,Error::InvalidPointer,
+                      Error::Unavailable,Error::Rejected})
+        assert(!canSubmit(true,error));
     const WakeBaseline before{0x00000909, 9, 9, 1, true};
     const WakeBaseline noSnapshot{};
 

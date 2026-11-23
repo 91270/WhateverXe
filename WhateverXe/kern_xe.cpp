@@ -16247,58 +16247,104 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   auto p=patcher.solveSymbol<mach_vm_address_t>(index,wake[i],address,size);
   ok=ok && p==address+wakeOffsets[i];tglCSBForceWake[i]=reinterpret_cast<TGLCSBForceWake>(p);
  }
- // Both native TGL and Display13 filters can dispatch GT submission in IRQ.
- // Qualify the common counted entry before installing any CSB submission hooks.
- // Keep its native refcounts/client/ACK; do not substitute the uncounted client.
- if(ok) {
-  const uint8_t entry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
-  ok=size>0x28E19 && !memcmp(reinterpret_cast<void *>(address+0x28C2A),entry,sizeof(entry)) &&
-   *reinterpret_cast<uint8_t *>(address+0x28C9A)==0xE8 && *reinterpret_cast<uint8_t *>(address+0x28E14)==0xE9;
-  if(ok) {
-   KernelPatcher::RouteRequest protect {wake[0],xelpRegularForceWakeProtected,xelpRegularForceWakeOriginal};
-   ok=patcher.routeMultipleShort(index,&protect,1,address,size);patcher.clearError();
-  }
-  auto root=IORegistryEntry::getRegistryRoot();
-  root->setProperty("WhateverXeForceWakeIRQProtected",ok);
-  if(adlnDetected)root->setProperty("N97ForceWakeIRQProtected",ok);
-  if(ok)if(auto data=OSSerializer::forTarget(nullptr,xelpForceWakeIRQSerialize)) {
-   root->setProperty("WhateverXeForceWakeIRQ",data);data->release();
-  }
- }
- // r107: the 12-entry consumer requires the matching hardware capacity.
- // PRM vol2c printed1037 / Linux enable_execlists: GFX_MODE bit3=1.
- // Change only the native initModeRegisters store operand, before HWS setup
- // and first submission, never a live mode toggle. First qualification must
- // start from power-on reset; subsequent hardware reset uses native ordering.
+ // Validate every byte/symbol needed for the CSB12 conversion BEFORE
+ // installing hooks or mutating native code. The Lilu patcher has no
+ // per-routeMultiple rollback: an installed-but-uncommitted hook must
+ // always be able to delegate to the original six-entry native path.
  const uint8_t modeFind[] {0xC7,0x04,0x30,0x00,0x00,0x08,0x00};
  const uint8_t modeReplace[] {0xC7,0x04,0x30,0x08,0x00,0x08,0x00};
+ const uint8_t resetFind[] {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
+ const uint8_t resetReplace[] {0xB8,11,0,0,0,0x89,0x87,4,0x1C,0,0};
  auto modeSite=reinterpret_cast<uint8_t *>(address+0x28E45);
- ok=ok && patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator17initModeRegistersEv",address,size)==address+0x28E1A &&
-  !memcmp(modeSite,modeFind,sizeof(modeFind));
- if (ok) {
-  KernelPatcher::LookupPatch modePatch {currentGraphics,modeFind,modeReplace,sizeof(modeFind),1};
-  patcher.applyLookupPatch(&modePatch,modeSite,sizeof(modeFind)+1);
-  ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(modeSite,modeReplace,sizeof(modeReplace));
+ auto resetSite=reinterpret_cast<uint8_t *>(address+0x3A3A4);
+ const uint8_t wakeEntry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+ // Lilu 1.7.2 copies a whole-instruction prologue when routing. The exact
+ // reset donor has 14 bytes of pushes before the first reset-index MOV at
+ // offset +14, so patching that MOV after route does NOT modify an already
+ // copied trampoline. Reject a donor with a changed instruction boundary.
+ const uint8_t resetEntry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+ ok=ok && size>0x3CC84 &&
+   patcher.solveSymbol<mach_vm_address_t>(index,
+     "__ZN16IntelAccelerator17initModeRegistersEv",address,size)==address+0x28E1A &&
+   !memcmp(modeSite,modeFind,sizeof(modeFind)) &&
+   !memcmp(reinterpret_cast<void *>(address+0x3A396),resetEntry,sizeof(resetEntry)) &&
+   !memcmp(resetSite,resetFind,sizeof(resetFind)) &&
+   !memcmp(reinterpret_cast<void *>(address+0x28C2A),wakeEntry,sizeof(wakeEntry)) &&
+   *reinterpret_cast<uint8_t *>(address+0x28C9A)==0xE8 &&
+   *reinterpret_cast<uint8_t *>(address+0x28E14)==0xE9;
+ patcher.clearError();
+
+ // The counted ForceWake client is required by both native GT submission
+ // and the CSB12 handler. This hook forwards original refcount semantics.
+ if(ok) {
+  KernelPatcher::RouteRequest protect {wake[0],xelpRegularForceWakeProtected,xelpRegularForceWakeOriginal};
+  ok=patcher.routeMultipleShort(index,&protect,1,address,size);
+  patcher.clearError();
  }
- IORegistryEntry::getRegistryRoot()->setProperty("TGLCSB12ModePatched",ok);
- // The original reset writes head/tail itself before context replay. Keep those
- // stores but change their reset value, so it cannot undo initialize() above.
- const uint8_t find[] {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
- const uint8_t replace[] {0xB8,11,0,0,0,0x89,0x87,4,0x1C,0,0};
- auto site=reinterpret_cast<uint8_t *>(address+0x3A3A4);
- ok=ok && !memcmp(site,find,sizeof(find));patcher.clearError();
- if (ok) {
-  KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
-  patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
-  ok=!memcmp(site,replace,sizeof(replace));
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WhateverXeForceWakeIRQProtected",ok);
+ if(adlnDetected)root->setProperty("N97ForceWakeIRQProtected",ok);
+ if(ok)if(auto data=OSSerializer::forTarget(nullptr,xelpForceWakeIRQSerialize)) {
+  root->setProperty("WhateverXeForceWakeIRQ",data);data->release();
  }
- if (ok) ok=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
- auto root=IORegistryEntry::getRegistryRoot();root->setProperty("TGLCSB12Routed",ok);
- if (ok) {
+
+ // Route ALL CSB consumers first. Any partially installed hook will use its
+ // native fallback until tglCSB12Enabled is published at commit. Hardware
+ // remains in its original six-entry mode at this stage.
+ if(ok) {
+  ok=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+  patcher.clearError();
+ }
+
+ // Apply the reset-index patch first; then enable the matching GFX_MODE on
+ // the donor's original initialization path. If either fails, undo BOTH
+ // text edits, with a readback; never silently continue an inconsistent mode.
+ // Unknown donors and failures before the first text write are NOT rollback
+ // errors and must be rejected without panic.
+ bool textPatchesAttempted=false;
+ if(ok) {
+  textPatchesAttempted=true;
+  KernelPatcher::LookupPatch patch {currentGraphics,resetFind,resetReplace,sizeof(resetFind),1};
+  patcher.applyLookupPatch(&patch,resetSite,sizeof(resetFind)+1);
+  ok=patcher.getError()==KernelPatcher::Error::NoError &&
+     !memcmp(resetSite,resetReplace,sizeof(resetReplace));
+  patcher.clearError();
+ }
+ if(ok) {
+  KernelPatcher::LookupPatch patch {currentGraphics,modeFind,modeReplace,sizeof(modeFind),1};
+  patcher.applyLookupPatch(&patch,modeSite,sizeof(modeFind)+1);
+  ok=patcher.getError()==KernelPatcher::Error::NoError &&
+     !memcmp(modeSite,modeReplace,sizeof(modeReplace));
+  patcher.clearError();
+ }
+ if(!ok && textPatchesAttempted) {
+  // A successful Lilu lookup write may precede a reported error. Reverse
+  // in order. Partial/unknown byte mutations, rollback API errors or failed
+  // restoration are fatal: native six-entry code cannot run against CSB12.
+  bool rollbackOK=true;
+  if(!memcmp(modeSite,modeReplace,sizeof(modeReplace))) {
+   KernelPatcher::LookupPatch restore {currentGraphics,modeReplace,modeFind,sizeof(modeFind),1};
+   patcher.applyLookupPatch(&restore,modeSite,sizeof(modeReplace)+1);
+   rollbackOK=patcher.getError()==KernelPatcher::Error::NoError && rollbackOK;
+   patcher.clearError();
+  }
+  if(!memcmp(resetSite,resetReplace,sizeof(resetReplace))) {
+   KernelPatcher::LookupPatch restore {currentGraphics,resetReplace,resetFind,sizeof(resetFind),1};
+   patcher.applyLookupPatch(&restore,resetSite,sizeof(resetReplace)+1);
+   rollbackOK=patcher.getError()==KernelPatcher::Error::NoError && rollbackOK;
+   patcher.clearError();
+  }
+  if(!rollbackOK || memcmp(modeSite,modeFind,sizeof(modeFind)) ||
+     memcmp(resetSite,resetFind,sizeof(resetFind)))
+   PANIC("igfx","CSB12 incomplete install: unable to restore original donor code");
+ }
+ root->setProperty("TGLCSB12ModePatched",ok);
+ root->setProperty("TGLCSB12Routed",ok);
+ if(ok) {
   auto data=OSSerializer::forTarget(nullptr,tglCSBSerialize);
-  if (data) {root->setProperty("TGLCSB12Live",data);data->release();}
+  if(data) {root->setProperty("TGLCSB12Live",data);data->release();}
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
-  if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
+  if(modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
  }
  if (ok && checkKernelArgument("-wex-tgl-s0-csb-resync")) {
   // Both path and address are qualified against the analyzed donor build.
@@ -16323,6 +16369,10 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
 
 bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,unsigned engine) {
  const bool ok=FunctionCast(wrapTGLCSBInit,callbackXE->orgTGLCSBInit)(streamer,owner,loop,scheduler,engine);
+ // Lilu routeMultiple can leave an earlier hook installed when a later
+ // hook fails. Until the complete CSB12 transaction commits, delegate to
+ // Apple's unmodified six-entry implementation.
+ if (!tglCSB12Enabled) return ok;
  if (ok) {
   // Streamer construction precedes graphics-engine startup. Initialize CPU
   // storage here, but defer forcewake/MMIO until the first submission or the
@@ -16342,6 +16392,10 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  return ok;
 }
 void XE::wrapTGLCSBWake(void *streamer) {
+ if (!tglCSB12Enabled) {
+  FunctionCast(wrapTGLCSBWake,callbackXE->orgTGLCSBWake)(streamer);
+  return;
+ }
  // The default wake policy remains CSB reinitialization; snapshot-based
  // preservation is opt-in. Never invoke the native six-entry reset (pointer 7).
  if (!checkKernelArgument("-wex-tgl-s0-csb-resync") || !tglS0SleepHookRouted) {
@@ -16396,10 +16450,24 @@ void XE::wrapTGLCSBWake(void *streamer) {
  if (modeReady && !preserve) tglCSBInitialize(streamer);
 }
 void XE::wrapTGLCSBReset(void *streamer) {
+ if (!tglCSB12Enabled) {
+  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+  return;
+ }
  tglCSBInitialize(streamer);
+ // Native processGPUReset may invoke submitExecList(0x80) internally.
+ // It has no mechanism to report our failed CSB12 mode initialization.
+ TGLCSBIO io(streamer,0);const auto &engine=tglCSBEngines[io.engine];
+ if (!TGLCSB::canSubmit(engine.hardwareReady,engine.state.error))
+  PANIC("igfx","CSB12 GPU reset blocked: unready e=%u error=%u",
+        io.engine,static_cast<unsigned>(engine.state.error));
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
+ if (!tglCSB12Enabled) {
+  FunctionCast(wrapTGLCSBProcess,callbackXE->orgTGLCSBProcess)(streamer,flags);
+  return;
+ }
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
@@ -17112,6 +17180,13 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
   TGLCSBIO io(streamer,flags);auto &e=tglCSBEngines[io.engine];
   if (e.streamer!=streamer) PANIC("igfx","CSB12 submission before native init");
   if (!e.hardwareReady) tglCSBInitialize(streamer,flags);
+  // Native submitExecList is void and unconditionally updates scheduler and
+  // HW work.  A failed 12-entry mode re-arm must never reach that path.
+  // There is no verified completion/error callback at this boundary; do not
+  // silently discard pending stamps or fabricate successful GPU execution.
+  if (!TGLCSB::canSubmit(e.hardwareReady,e.state.error))
+   PANIC("igfx","CSB12 submit blocked: mode/queue unready e=%u error=%u",
+         io.engine,static_cast<unsigned>(e.state.error));
   uint64_t nativeFlags;memcpy(&nativeFlags,io.owner+0x1190,sizeof(nativeFlags));
   // Gen12 RCS SQ/LOAD require render forcewake. Use the same refcounted API
   // as native submitExecList (3A878/3AA50), independently of flags40. The

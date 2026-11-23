@@ -8,7 +8,7 @@ p=argparse.ArgumentParser();p.add_argument('--donor',type=pathlib.Path);a=p.pars
 s=(r/'WhateverXe/kern_xe.cpp').read_text()
 start=s.index('void xelpRegularForceWakeProtected(');end=s.index('bool xelpForceWakeIRQSerialize',start);body=s[start:end]
 # Regression: a shared wrapper must actually be routed for TGL, not only ADL-N.
-route=s[s.index(' const char *wake[]'):s.index(' // r107:',s.index(' const char *wake[]'))]
+route=s[s.index(' const char *wake[]'):s.index(' if (ok && checkKernelArgument("-wex-tgl-s0-csb-resync"))',s.index(' const char *wake[]'))]
 assert 'if(ok) {' in route and 'if(ok && adlnDetected)' not in route
 assert 'protect {wake[0],xelpRegularForceWakeProtected,xelpRegularForceWakeOriginal}' in route
 assert 'WhateverXeForceWakeIRQProtected' in route
