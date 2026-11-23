@@ -17,6 +17,15 @@ state=re.search(r"// Sticky first-AUX command identity.*?\nstatic uint32_t tglED
 marker=re.search(r"uint32_t XE::wrapTGLFramebufferWakeEpoch\(.*?\n\}",src,re.S)
 assert first and state
 assert header and body and aux and marker
+# Regression gate: retire the disproven PWM re-arm path without weakening
+# the existing native display-wake handoff and AUX diagnostic hooks.
+wake = marker.group(0)
+assert 'checkKernelArgument("-wex-tgl-displaywake-pwm")' not in src
+assert "TGLDisplayWakePWM::" not in src
+assert not (repo/"WhateverXe/kern_tgl_display_wake_pwm.hpp").exists()
+assert not (repo/"tests/tgl_display_wake_pwm.cpp").exists()
+assert "getPG(" not in wake and "write(" not in wake and "read(" not in wake
+assert "FunctionCast(wrapTGLFramebufferWakeEpoch" in wake
 for check in (
     "tglEDPPanelNativeMMIORecord(access,reg,false,value,",
     "tglEDPPanelNativeMMIORecord(access,reg,true,value,",
