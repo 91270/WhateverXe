@@ -48,6 +48,52 @@ prose. CHANGELOG describes the affected behavior and OS range; applications used
 for validation are not the scope of a general fix. Credit reference repositories
 when their work informed a change.
 
+## Root-cause investigation and general repairs
+
+Investigate to establish the mechanism that violates a software or hardware
+contract, not merely to narrow the symptom or produce a patch that appears to
+work. Use the chain: symptom -> earliest causally relevant divergence -> executed
+call path -> violated invariant -> proven root cause -> minimal repair -> verification.
+Keep observations, hypotheses, confirmed causes, mitigations and repairs distinct.
+
+Before new experiments, inspect the current Git state, upstream work, prior
+reports, tests and original logs; reuse established evidence and avoid repeating
+inconclusive tests. Form competing hypotheses and identify what existing evidence
+would falsify each. Compare good and bad paths under equivalent versions and
+conditions; do not mistake downstream cleanup or recovery effects for the cause.
+
+For opaque drivers, reconstruct real ABI, control flow, caller/callee contracts,
+object and resource ownership, synchronization, power transitions and error paths
+from actual binaries plus available source and hardware specifications. Verify
+the reverse-engineering tool exists before claiming to have used it; prefer
+REA/Ghidra when installed, otherwise use available native disassembly tools.
+Record architecture, binary fingerprint, symbols/addresses and exact provenance.
+Historical decompiler logs are prior evidence, not a new reverse-engineering run;
+decompiler output is an interpretation, not original source.
+
+Separate a software branch or MMIO write request from hardware readback, ACK,
+settled state and actual functional recovery. Static control flow cannot prove an
+unobserved physical state. If that state decides between hypotheses, add only
+the necessary bounded, explicitly enabled observation under correct native
+ownership; state what it measures, what it cannot prove and any timing impact.
+Do not run uncontrolled reboot/sleep loops or speculative register experiments.
+A diagnostic or temporary A/B workaround is not a root-cause repair.
+
+Do not treat arbitrary delays, extra retries, forced power-domain resets,
+reference-count changes, register replay or feature disabling as general fixes
+without a demonstrated causal contract. Once the cause is established, patch at
+the owning lifecycle boundary with capability/architecture and OS-ABI guards,
+safe failure behavior and minimal scope; avoid one-device IDs, offsets or magic
+values as the basis for general compatibility.
+
+Validate claims separately: static/binary evidence, production-path unit tests,
+build, driver installation/loading and controlled hardware behavior. Compilation,
+mocked tests, hook routing, a single successful wake or disappearance of a symptom
+do not prove hardware recovery or cross-device compatibility. Preserve negative
+findings, exact conditions and remaining uncertainties; when evidence is
+insufficient to establish a cause, report that explicitly instead of shipping an
+unproven fix.
+
 ## Build and test
 
 Before implementation or test changes, read and apply the
