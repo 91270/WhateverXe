@@ -261,8 +261,47 @@ int main() {
   firstCmd=firstCommand();
   assert(firstCmd.epoch==5 && firstCmd.auxValid==1 && firstCmd.dataValid==0);
 
+  // New independent epoch: inspect both native hwConfigureCustomAUX
+  // configuration banks without touching MMIO or fabricating a readback.
+  freshWake();
+  const auto countBeforeCustom=tglEDPAUXMMIOCount;
+  const uint32_t customEpoch=tglEDPAUXWakeEpoch;
+  tglEDPAUXNativeMMIORecord(access,0x86338,true,0x11,(void*)0x999,true,controller);
+  tglEDPAUXNativeMMIORecord(access,0x86364,true,0x8850023f,(void*)0x999,true,controller);
+  tglEDPAUXNativeMMIORecord(access,0x80040,true,0x22,(void*)0x999,true,controller);
+  tglEDPAUXNativeMMIORecord(access,0x8006C,true,0x33,(void*)0x999,true,controller);
+  tglEDPAUXNativeMMIORecord(access,0x80058,false,0x44,(void*)0x999,true,controller);
+  // Reject misalignment, out-of-range addresses, disabled diagnostics and
+  // foreign accessor ownership. No fallback/probing of unknown banks.
+  for(uint32_t reg:{0x86337U,0x86339U,0x86368U,0x8003CU,0x80041U,0x80070U,0xDEADU})
+    tglEDPAUXNativeMMIORecord(access,reg,true,0x777,(void*)0x999,true,controller);
+  tglEDPAUXNativeMMIORecord(access,0x8633C,true,0x777,(void*)0x999,false,controller);
+  tglEDPAUXNativeMMIORecord(&fakeAccess2,0x8633C,true,0x777,(void*)0x999,true,controller);
+  assert(tglEDPAUXMMIOCount==countBeforeCustom+5);
+  for(uint32_t i=0;i<5;++i) {
+    const auto &rec=tglEDPAUXMMIOFirst[i];
+    assert(rec.word[0]==countBeforeCustom+i+1);
+    assert(rec.word[1]==customEpoch);
+    assert(rec.word[2]==(i==4 ? 0U : 1U));
+  }
+  assert(tglEDPAUXMMIOFirst[0].word[3]==0x86338);
+  assert(tglEDPAUXMMIOFirst[1].word[3]==0x86364);
+  assert(tglEDPAUXMMIOFirst[2].word[3]==0x80040);
+  assert(tglEDPAUXMMIOFirst[3].word[3]==0x8006C);
+  assert(tglEDPAUXMMIOFirst[4].word[3]==0x80058);
+  assert(tglEDPAUXMMIOFirst[4].word[4]==0x44);
+  firstAUX();
+  firstCmd=firstCommand();
+  assert(firstCmd.epoch==customEpoch && firstCmd.auxValid && firstCmd.dataValid);
+  assert(tglEDPAUXMMIOFirst[4].ns<=firstCmd.auxCtl.ns);
+  assert(firstCmd.auxCtl.word[3]==0x64010);
+  // Post-SEND reads are not proof that the pre-SEND configuration succeeded.
+  tglEDPAUXNativeMMIORecord(access,0x8633C,false,0x55,(void*)0x999,true,controller);
+  assert(tglEDPAUXMMIOCount==countBeforeCustom+8);
+  assert(tglEDPAUXMMIOFirst[4].word[4]==0x44);
+
   assert(!locked);
-  std::puts("PASS: framebuffer epoch and native delegation, PPS/HPD recorder and serialization, first AUX latch, independent rings, failure cleanup");
+  std::puts("PASS: framebuffer epoch and native delegation, passive native Custom AUX/DC6 receipts, PPS/HPD recorder and serialization, first AUX latch, independent rings, failure cleanup");
 }
 """
 out=(fixture.replace("///PRODUCTION_TYPE",header.group()).replace("///PRODUCTION_STATE",state.group()).replace("///PRODUCTION_PANEL",body.group()).replace("///PRODUCTION_AUX",aux.group()).replace("///PRODUCTION_FIRST",first.group()).replace("///PRODUCTION_MARKER",marker.group()))

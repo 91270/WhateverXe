@@ -3474,8 +3474,17 @@ static bool tglEDPPanelPreAUXSerialize(void *,void *,OSSerialize *serializer) {
 static void tglEDPAUXNativeMMIORecord(void *access, unsigned long reg, bool write,
                                      uint32_t value, void *returnAddress,
                                      bool diagEnabled, void *controllerAddress) {
+ // Observe only the native register transactions associated with
+ // hwConfigureCustomAUX() on Tiger Lake. setDCState() selects one of
+ // these banks using the native controller's DC configuration. This does
+ // not read MMIO, change power ownership, or infer that a write took effect.
+ // Both banks are eligible: do not bind the diagnostic to one VBT/device ID.
+ const bool customAUX =
+     ((reg >= 0x86338 && reg <= 0x86364) ||
+      (reg >= 0x80040 && reg <= 0x8006C)) && (reg & 3U)==0;
  if(!diagEnabled || !tglAUXLock ||
-    (reg!=0x64010 && reg!=0x64014 && reg!=0x45444 && reg!=0x45454 &&
+    (!customAUX && reg!=0x64010 && reg!=0x64014 &&
+     reg!=0x45444 && reg!=0x45454 &&
      reg!=0x45404 && reg!=0x45504))return;
  auto controller=static_cast<uint8_t *>(controllerAddress);
  if(!controller || !access || *reinterpret_cast<void **>(controller+0xC40)!=access)return;
