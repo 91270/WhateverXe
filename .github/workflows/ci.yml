@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - research/tgl-aux-dc6-native-witness-20261123
     tags: ['*']
   pull_request:
   workflow_dispatch:
@@ -56,13 +58,27 @@ jobs:
           python3 tools/package.py --build build/RELEASE --configuration RELEASE --tag "$RELEASE_TAG"
           cd build/dist
           shasum -a 256 *.zip > SHA256SUMS
-      - name: Upload packages
+      - name: Upload packages for release consumers
+        if: >-
+          (github.event_name == 'push' &&
+           github.repository == 'b00t0x/WhateverXe' &&
+           startsWith(github.ref, 'refs/tags/')) ||
+          ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+           github.repository == '91270/WhateverXe' &&
+           github.ref == 'refs/heads/research/tgl-aux-dc6-native-witness-20261123')
         uses: actions/upload-artifact@v4
         with:
           name: Artifacts
-          path: build/dist/*
+          path: |
+            build/dist/*.zip
+            build/dist/SHA256SUMS
+            !build/dist/*.map
+            !build/dist/*.log
+            !build/dist/**/*.map
+            !build/dist/**/*.log
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
+          compression-level: 9
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,7 +88,8 @@ jobs:
             build/tests/**/test.log
             build/tests/**/results.json
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 3
+          compression-level: 9
 
   release:
     name: Create draft release
@@ -112,3 +129,70 @@ jobs:
           fi
           gh release edit "$RELEASE_TAG" --notes-file ../release-notes.md
           gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber
+
+  nightly:
+    name: Update rolling Nightly pre-release
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/research/tgl-aux-dc6-native-witness-20261123' &&
+      github.repository == '91270/WhateverXe'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: whateverxe-nightly
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Artifacts
+          path: dist
+      - name: Publish rolling Nightly pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: nightly
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --prerelease --title "WhateverXe Nightly" \
+              --notes "Rolling nightly build from commit $GITHUB_SHA." --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --prerelease \
+              --title "WhateverXe Nightly" \
+              --notes "Rolling nightly build from commit $GITHUB_SHA." --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+
+  cleanup-artifacts:
+    name: Delete temporary build artifact
+    needs: [build, release, nightly]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete this run's cross-job package artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_ids="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "Artifacts") | .id')"
+          while IFS= read -r artifact_id; do
+            [[ -n "$artifact_id" ]] || continue
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" >/dev/null
+            echo "Deleted temporary artifact $artifact_id"
+          done <<< "$artifact_ids"
