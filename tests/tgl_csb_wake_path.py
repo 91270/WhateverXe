@@ -49,15 +49,18 @@ checks = {
         "io.readTail()" in snapshot and "io.hwsp+0xBC" not in snapshot,
     "sleep wrapper no longer accesses GPU MMIO after native power quiesce":
         "TGLCSBIO" not in sleep and "io.acquire()" not in sleep
-        and sleep.index("tglS0CaptureAccelerator,accelerator") < sleep.rindex("original(bridge);")
-        < sleep.index("tglS0CaptureAccelerator,static_cast<void *>(nullptr)"),
+        and sleep.index("tglS0CaptureBridge,bridge") < sleep.rindex("original(bridge);")
+        < sleep.index("tglS0CaptureBridge,static_cast<void *>(nullptr)"),
     "snapshot occurs before native bridge IRQ disable, not after":
         bridge.index("tglS0CaptureBeforeIRQDisable(accelerator,epoch)")
         < bridge.index("tglS0OrgDisableInterrupts)(bridge)"),
-    "only native accelerator bridge disable can claim the one-shot snapshot":
-        "bridge)+0x10" in bridge
-        and "__atomic_compare_exchange_n(&tglS0CaptureAccelerator" in bridge
-        and "if(epoch)" in bridge,
+    "only the same bridge instance can claim the one-shot snapshot":
+        "__atomic_compare_exchange_n(&tglS0CaptureBridge" in bridge
+        and "bridge)+0x10" in bridge
+        and "if(epoch && accelerator)" in bridge,
+    "snapshot skips streamer owned by any other accelerator":
+        "engine.streamer)+0x10" in snapshot
+        and "!=accelerator)continue" in snapshot,
     "both original sleep and IRQ disable must be routed after exact donor checks":
         installer.index('sleepSymbol="__ZN17IGInterruptBridge15systemWillSleepEv"')
         < installer.index('irqSymbol="__ZN17IGInterruptBridge17disableInterruptsEv"')

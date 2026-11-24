@@ -16137,7 +16137,9 @@ static bool tglS0SleepHookRouted {};
 // IGInterruptBridge::disableInterrupts(), which itself uses SafeForceWake.
 // Capture at that native boundary while the bridge still owns the GPU, NOT
 // after IntelAccelerator::systemWillSleep() has quiesced the bridge.
-static void *tglS0CaptureAccelerator {};
+// The IRQ disable must belong to the very bridge in native
+// IGInterruptBridge::systemWillSleep, not merely share an accelerator owner.
+static void *tglS0CaptureBridge {};
 static uint32_t tglS0CaptureEpoch {};
 static uint32_t tglS0WakeTrace[6][13] {};
 static uint32_t tglS0WakeCount {};
@@ -16150,6 +16152,10 @@ static void tglS0CaptureBeforeIRQDisable(void *accelerator,uint32_t epoch) {
   record.streamer=engine.streamer;
   if (!engine.streamer || !engine.hardwareReady ||
       engine.state.error!=TGLCSB::Error::None)continue;
+  // One plugin instance can encounter more than one GPU provider. Never
+  // sample a streamer owned by an accelerator unrelated to this bridge.
+  if(*reinterpret_cast<void **>(static_cast<uint8_t *>(engine.streamer)+0x10)
+      !=accelerator)continue;
   TGLCSBIO io(engine.streamer,0);io.acquire();
   const auto pointer=io.readMMIOPointer();
   const auto tail=io.readTail();
@@ -16169,16 +16175,16 @@ static void tglS0CaptureBeforeIRQDisable(void *accelerator,uint32_t epoch) {
 // contract. A matching accelerator+epoch is armed around the native
 // systemWillSleep() call. Other disables always delegate untouched.
 static void tglS0WrapDisableInterrupts(void *bridge) {
- auto accelerator=bridge
-    ? *reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10)
-    : nullptr;
- auto expected=accelerator;
- if(accelerator &&
-    __atomic_compare_exchange_n(&tglS0CaptureAccelerator,&expected,
+ // The exact bridge identity is required; a different bridge can share the
+ // same IntelAccelerator owner without being in this S0 sleep transition.
+ auto expected=bridge;
+ if(bridge &&
+    __atomic_compare_exchange_n(&tglS0CaptureBridge,&expected,
                                 static_cast<void *>(nullptr),false,
                                 __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
   const auto epoch=__atomic_load_n(&tglS0CaptureEpoch,__ATOMIC_ACQUIRE);
-  if(epoch)tglS0CaptureBeforeIRQDisable(accelerator,epoch);
+  auto accelerator=*reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10);
+  if(epoch && accelerator)tglS0CaptureBeforeIRQDisable(accelerator,epoch);
  }
  reinterpret_cast<void (*)(void *)>(tglS0OrgDisableInterrupts)(bridge);
 }
@@ -16199,9 +16205,9 @@ static void tglS0WrapBridgeSystemWillSleep(void *bridge) {
   record.before.valid=false;
  }
  __atomic_store_n(&tglS0CaptureEpoch,epoch,__ATOMIC_RELEASE);
- __atomic_store_n(&tglS0CaptureAccelerator,accelerator,__ATOMIC_RELEASE);
+ __atomic_store_n(&tglS0CaptureBridge,bridge,__ATOMIC_RELEASE);
  original(bridge);
- __atomic_store_n(&tglS0CaptureAccelerator,static_cast<void *>(nullptr),__ATOMIC_RELEASE);
+ __atomic_store_n(&tglS0CaptureBridge,static_cast<void *>(nullptr),__ATOMIC_RELEASE);
  __atomic_store_n(&tglS0CaptureEpoch,0U,__ATOMIC_RELEASE);
 }
 

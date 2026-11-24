@@ -42,7 +42,7 @@ for item in (
     'tglS0WrapBridgeSystemWillSleep',
     'tglS0WrapDisableInterrupts',
     'tglS0CaptureBeforeIRQDisable',
-    '__atomic_compare_exchange_n(&tglS0CaptureAccelerator',
+    '__atomic_compare_exchange_n(&tglS0CaptureBridge',
 ):
     assert item in source_code, f"missing opt-in S0 native boundary contract: {item}"
 

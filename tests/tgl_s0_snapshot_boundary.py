@@ -31,7 +31,7 @@ sleep = function("static void tglS0WrapBridgeSystemWillSleep(void *bridge)")
 assert "tglS0CaptureBeforeIRQDisable(accelerator,epoch)" in bridge
 assert "tglS0CaptureBeforeIRQDisable" not in sleep
 assert bridge.index("tglS0CaptureBeforeIRQDisable") < bridge.index("tglS0OrgDisableInterrupts)(bridge)")
-assert sleep.index("tglS0CaptureAccelerator,accelerator") < sleep.rindex("original(bridge);")
+assert sleep.index("tglS0CaptureBridge,bridge") < sleep.rindex("original(bridge);")
 
 harness = r"""
 #include <cassert>
@@ -48,13 +48,14 @@ static uint32_t tglS0Epoch=0;
 static mach_vm_address_t tglS0OrgBridgeSystemWillSleep=0;
 static mach_vm_address_t tglS0OrgDisableInterrupts=0;
 static bool tglS0SleepHookRouted=false;
-static void *tglS0CaptureAccelerator=nullptr;
+static void *tglS0CaptureBridge=nullptr;
 static uint32_t tglS0CaptureEpoch=0;
 static int snapshots=0,originalIRQ=0,originalSleep=0;
 static std::vector<std::string> events;
 struct Bridge {void *vtable;void *pad;void *accelerator;};
-static Bridge matching {}, foreign {};
+static Bridge matching {}, foreign {}, sameOwnerForeign {};
 static bool nativeCallsIRQ=true,invokeForeign=true,invokeTwice=true;
+static bool invokeSameOwnerForeign=true;
 
 static void tglS0CaptureBeforeIRQDisable(void *accelerator,uint32_t epoch) {
  assert(accelerator==matching.accelerator);
@@ -74,6 +75,7 @@ static void nativeSleep(void *bridge) {
  events.emplace_back("native-sleep-start");
  ++originalSleep;
  if(invokeForeign)tglS0WrapDisableInterrupts(&foreign);
+ if(invokeSameOwnerForeign)tglS0WrapDisableInterrupts(&sameOwnerForeign);
  if(nativeCallsIRQ) {
   tglS0WrapDisableInterrupts(&matching);
   if(invokeTwice)tglS0WrapDisableInterrupts(&matching);
@@ -85,10 +87,12 @@ static void nativeSleep(void *bridge) {
 void init() {
  snapshots=originalIRQ=originalSleep=0;events.clear();
  tglS0SleepHookRouted=true;nativeCallsIRQ=true;invokeForeign=true;invokeTwice=true;
- tglS0CaptureAccelerator=nullptr;tglS0CaptureEpoch=0;
+ invokeSameOwnerForeign=true;
+ tglS0CaptureBridge=nullptr;tglS0CaptureEpoch=0;
  tglS0Sleep[0].epoch=0; tglS0Sleep[0].before.valid=false;
  matching.accelerator=reinterpret_cast<void *>(0x100000);
  foreign.accelerator=reinterpret_cast<void *>(0x200000);
+ sameOwnerForeign.accelerator=matching.accelerator;
  tglS0OrgBridgeSystemWillSleep=reinterpret_cast<mach_vm_address_t>(&nativeSleep);
  tglS0OrgDisableInterrupts=reinterpret_cast<mach_vm_address_t>(&nativeDisable);
 }
@@ -97,14 +101,14 @@ int main() {
  // A matching native bridge request captures once, after a foreign callback
  // and before the native IRQ mask write; later disables cannot mutate epoch.
  tglS0WrapBridgeSystemWillSleep(&matching);
- assert(snapshots==1 && originalIRQ==3 && originalSleep==1);
+ assert(snapshots==1 && originalIRQ==4 && originalSleep==1);
  assert(tglS0Sleep[0].before.valid);
  assert(tglS0Sleep[0].epoch==tglS0Epoch);
- assert(tglS0CaptureAccelerator==nullptr && tglS0CaptureEpoch==0);
+ assert(tglS0CaptureBridge==nullptr && tglS0CaptureEpoch==0);
  assert(events==std::vector<std::string>({"native-sleep-start",
-             "native-disable","snapshot","native-disable","native-disable","native-sleep-end"}));
+             "native-disable","native-disable","snapshot","native-disable","native-disable","native-sleep-end"}));
  tglS0WrapDisableInterrupts(&matching);
- assert(snapshots==1 && originalIRQ==4);
+ assert(snapshots==1 && originalIRQ==5);
  std::cout<<"PASS native owner gate and exactly-once pre-IRQ snapshot\n";
 
  // If original sleep skips bridge disable, there must be NO new snapshot;
@@ -112,7 +116,7 @@ int main() {
  init();nativeCallsIRQ=false;
  tglS0WrapBridgeSystemWillSleep(&matching);
  assert(snapshots==0 && tglS0Sleep[0].epoch==0 && !tglS0Sleep[0].before.valid);
- assert(originalSleep==1 && originalIRQ==1);
+ assert(originalSleep==1 && originalIRQ==2);
  std::cout<<"PASS skipped IRQ disable leaves no stale sleep baseline\n";
 
  // All off-scope bridge disables must be forwarded unmodified.
@@ -120,16 +124,20 @@ int main() {
  tglS0WrapDisableInterrupts(&foreign);
  assert(snapshots==0 && originalIRQ==1);
  std::cout<<"PASS foreign bridge is native-only\n";
+ init();
+ tglS0WrapDisableInterrupts(&sameOwnerForeign);
+ assert(snapshots==0 && originalIRQ==1 && tglS0CaptureBridge==nullptr);
+ std::cout<<"PASS a different bridge with the same accelerator cannot claim the capture\n";
 
  // If the optional pair did not fully route, do NOT arm for snapshots.
  init();tglS0SleepHookRouted=false;
  tglS0WrapBridgeSystemWillSleep(&matching);
- assert(snapshots==0 && originalSleep==1 && originalIRQ==3);
- assert(tglS0CaptureAccelerator==nullptr && tglS0CaptureEpoch==0);
+ assert(snapshots==0 && originalSleep==1 && originalIRQ==4);
+ assert(tglS0CaptureBridge==nullptr && tglS0CaptureEpoch==0);
  std::cout<<"PASS inactive partial route does not sample GPU\n";
 
  // Retry after valid capture requires an explicit new sleep epoch.
- init();invokeForeign=false;invokeTwice=false;
+ init();invokeForeign=false;invokeSameOwnerForeign=false;invokeTwice=false;
  tglS0WrapBridgeSystemWillSleep(&matching);
  const uint32_t epoch=tglS0Sleep[0].epoch;
  assert(snapshots==1 && epoch==tglS0Epoch);
