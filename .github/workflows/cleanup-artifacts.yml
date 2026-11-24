@@ -1,0 +1,48 @@
+name: Cleanup old workflow artifacts
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: Delete artifacts older than this many days (1-90)
+        required: false
+        default: 3
+        type: number
+
+permissions: {}
+
+jobs:
+  cleanup:
+    name: Delete old Actions artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Delete artifacts older than retention window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RETENTION_DAYS: ${{ inputs.retention_days || 3 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || (( RETENTION_DAYS < 1 || RETENTION_DAYS > 90 )); then
+            echo "retention_days must be an integer from 1 to 90" >&2
+            exit 1
+          fi
+          cutoff_epoch="$(date -u -d "$RETENTION_DAYS days ago" +%s)"
+          artifact_rows="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.id, .created_at] | @tsv')"
+          deleted=0
+          while IFS=$'\t' read -r artifact_id created_at; do
+            [[ -n "$artifact_id" ]] || continue
+            created_epoch="$(date -u -d "$created_at" +%s)"
+            if (( created_epoch < cutoff_epoch )); then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" >/dev/null
+              echo "Deleted artifact $artifact_id created at $created_at"
+              deleted=$((deleted + 1))
+            fi
+          done <<< "$artifact_rows"
+          echo "Deleted $deleted artifact(s); retention window: $RETENTION_DAYS day(s)."
