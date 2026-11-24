@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - research/tgl-aux-dc6-native-witness-20261123
     tags: ['*']
   pull_request:
   workflow_dispatch:
@@ -59,13 +58,7 @@ jobs:
           cd build/dist
           shasum -a 256 *.zip > SHA256SUMS
       - name: Upload packages for release consumers
-        if: >-
-          (github.event_name == 'push' &&
-           github.repository == 'b00t0x/WhateverXe' &&
-           startsWith(github.ref, 'refs/tags/')) ||
-          ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-           github.repository == '91270/WhateverXe' &&
-           github.ref == 'refs/heads/research/tgl-aux-dc6-native-witness-20261123')
+        if: github.event_name == 'push' && github.repository == 'b00t0x/WhateverXe' && startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: Artifacts
@@ -130,63 +123,9 @@ jobs:
           gh release edit "$RELEASE_TAG" --notes-file ../release-notes.md
           gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber
 
-  nightly:
-    name: Update rolling Nightly pre-release
-    if: >-
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      github.ref == 'refs/heads/research/tgl-aux-dc6-native-witness-20261123' &&
-      github.repository == '91270/WhateverXe'
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    concurrency:
-      group: whateverxe-nightly
-      cancel-in-progress: false
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: Artifacts
-          path: dist
-      - name: Publish rolling Nightly pre-release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: nightly
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum -c SHA256SUMS
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" \
-              -f sha="$GITHUB_SHA" -F force=true >/dev/null
-          else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
-          fi
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --prerelease --title "WhateverXe Nightly" \
-              --notes "Rolling nightly build from commit $GITHUB_SHA." --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$RELEASE_TAG" --verify-tag --prerelease \
-              --title "WhateverXe Nightly" \
-              --notes "Rolling nightly build from commit $GITHUB_SHA." --repo "$GITHUB_REPOSITORY"
-          fi
-          gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
-          current_assets="$(printf '%s\n' *.zip SHA256SUMS)"
-          existing_assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' --repo "$GITHUB_REPOSITORY")"
-          while IFS= read -r asset_name; do
-            [[ -n "$asset_name" ]] || continue
-            if ! grep -Fxq "$asset_name" <<< "$current_assets"; then
-              gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes --repo "$GITHUB_REPOSITORY"
-              echo "Deleted stale Nightly asset: $asset_name"
-            fi
-          done <<< "$existing_assets"
-
   cleanup-artifacts:
     name: Delete temporary build artifact
-    needs: [build, release, nightly]
+    needs: [build, release]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
