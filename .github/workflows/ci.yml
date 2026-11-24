@@ -62,6 +62,7 @@ jobs:
           name: Artifacts
           path: build/dist/*
           if-no-files-found: error
+          retention-days: 7
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
