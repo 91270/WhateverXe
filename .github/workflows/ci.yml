@@ -1,4 +1,4 @@
-name: CI
+name: "WhateverXe：持续集成与发布"
 
 on:
   push:
@@ -6,7 +6,11 @@ on:
       - main
       - research/tgl-aux-dc6-native-witness-20261123
     tags: ['*']
+    paths-ignore:
+      - '.github/workflows/**'
   pull_request:
+    paths-ignore:
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
@@ -18,38 +22,41 @@ concurrency:
 
 jobs:
   build:
-    name: Test and build
+    name: 测试与驱动构建
     runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出 WhateverXe 源码
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - name: 检出 MacKernelSDK 头文件
+        uses: actions/checkout@v4
         with:
           repository: acidanthera/MacKernelSDK
           ref: 05094e5e88cec7caedbfb35e8449ed0db94bf95b
           path: MacKernelSDK
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - name: 检出 Lilu 依赖源码
+        uses: actions/checkout@v4
         with:
           repository: acidanthera/Lilu
           ref: 1.7.2
           path: build/dependencies/Lilu
           persist-credentials: false
-      - name: Prepare Lilu development files
+      - name: 准备 Lilu 开发文件
         shell: bash
         run: |
           mkdir -p Lilu.kext/Contents/Resources
           ln -s "$GITHUB_WORKSPACE/build/dependencies/Lilu/Lilu/Headers" Lilu.kext/Contents/Resources/Headers
           ln -s "$GITHUB_WORKSPACE/build/dependencies/Lilu/Lilu/Library" Lilu.kext/Contents/Resources/Library
-      - name: CPU tests
+      - name: 运行 CPU 单元测试
         run: python3 tools/test.py
-      - name: Build DEBUG
+      - name: 构建 DEBUG 版本
         run: python3 tools/build.py --output build/DEBUG
-      - name: Build RELEASE
+      - name: 构建 RELEASE 版本
         run: python3 tools/build.py --release --output build/RELEASE
-      - name: Package
+      - name: 打包驱动并生成 SHA-256 校验文件
         shell: bash
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -58,7 +65,7 @@ jobs:
           python3 tools/package.py --build build/RELEASE --configuration RELEASE --tag "$RELEASE_TAG"
           cd build/dist
           shasum -a 256 *.zip > SHA256SUMS
-      - name: Upload packages for release consumers
+      - name: 上传供发布任务使用的驱动构建产物
         if: >-
           (github.event_name == 'push' &&
            github.repository == 'b00t0x/WhateverXe' &&
@@ -68,7 +75,7 @@ jobs:
            github.ref == 'refs/heads/research/tgl-aux-dc6-native-witness-20261123')
         uses: actions/upload-artifact@v4
         with:
-          name: Artifacts
+          name: 驱动构建产物
           path: |
             build/dist/*.zip
             build/dist/SHA256SUMS
@@ -79,11 +86,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 9
-      - name: Upload test results
+      - name: 上传测试报告
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Test-results
+          name: 测试报告
           path: |
             build/tests/**/test.log
             build/tests/**/results.json
@@ -92,7 +99,7 @@ jobs:
           compression-level: 9
 
   release:
-    name: Create draft release
+    name: 创建正式版本草稿 Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'b00t0x/WhateverXe'
     needs: build
     runs-on: ubuntu-latest
@@ -100,14 +107,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出发布源码
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - name: 下载已验证的驱动构建产物
+        uses: actions/download-artifact@v4
         with:
-          name: Artifacts
+          name: 驱动构建产物
           path: dist
-      - name: Attach verified build artifacts
+      - name: 校验并附加驱动构建产物
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -115,7 +124,7 @@ jobs:
         run: |
           if gh release view "$RELEASE_TAG" --json isDraft,body \
               --jq 'select(.isDraft == true) | .body' > release-notes.md && test -s release-notes.md; then
-            : # Preserve release text explicitly supplied with the draft.
+            : # 保留已在草稿 Release 中填写的发布说明。
           else
             python3 tools/release_notes.py "$RELEASE_TAG" > release-notes.md
           fi
@@ -131,7 +140,7 @@ jobs:
           gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber
 
   nightly:
-    name: Update rolling Nightly pre-release
+    name: 更新 Nightly 滚动预发布版本
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/research/tgl-aux-dc6-native-witness-20261123' &&
@@ -145,11 +154,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: 下载 Nightly 构建产物
+        uses: actions/download-artifact@v4
         with:
-          name: Artifacts
+          name: 驱动构建产物
           path: dist
-      - name: Publish rolling Nightly pre-release
+      - name: 发布 Nightly 滚动预发布版本
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -166,12 +176,12 @@ jobs:
               -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --prerelease --title "WhateverXe Nightly" \
-              --notes "Rolling nightly build from commit $GITHUB_SHA." --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" --prerelease --title "WhateverXe Nightly 每夜构建" \
+              --notes "基于提交 $GITHUB_SHA 自动构建的 Nightly 测试版本。" --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$RELEASE_TAG" --verify-tag --prerelease \
-              --title "WhateverXe Nightly" \
-              --notes "Rolling nightly build from commit $GITHUB_SHA." --repo "$GITHUB_REPOSITORY"
+              --title "WhateverXe Nightly 每夜构建" \
+              --notes "基于提交 $GITHUB_SHA 自动构建的 Nightly 测试版本。" --repo "$GITHUB_REPOSITORY"
           fi
           gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
           current_assets="$(printf '%s\n' *.zip SHA256SUMS)"
@@ -180,28 +190,6 @@ jobs:
             [[ -n "$asset_name" ]] || continue
             if ! grep -Fxq "$asset_name" <<< "$current_assets"; then
               gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes --repo "$GITHUB_REPOSITORY"
-              echo "Deleted stale Nightly asset: $asset_name"
+              echo "已删除过期 Nightly 产物：$asset_name"
             fi
           done <<< "$existing_assets"
-
-  cleanup-artifacts:
-    name: Delete temporary build artifact
-    needs: [build, release, nightly]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - name: Delete this run's cross-job package artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          artifact_ids="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name == "Artifacts") | .id')"
-          while IFS= read -r artifact_id; do
-            [[ -n "$artifact_id" ]] || continue
-            gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" >/dev/null
-            echo "Deleted temporary artifact $artifact_id"
-          done <<< "$artifact_ids"
