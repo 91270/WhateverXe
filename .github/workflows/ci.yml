@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - fix-tgl-s0-shared-irq-route-20261124
     tags: ['*']
     paths-ignore:
       - '.github/workflows/**'
@@ -65,7 +66,13 @@ jobs:
           cd build/dist
           shasum -a 256 *.zip > SHA256SUMS
       - name: 上传供发布任务使用的驱动构建产物
-        if: github.event_name == 'push' && github.repository == 'b00t0x/WhateverXe' && startsWith(github.ref, 'refs/tags/')
+        if: >-
+          (github.event_name == 'push' &&
+           github.repository == 'b00t0x/WhateverXe' &&
+           startsWith(github.ref, 'refs/tags/')) ||
+          ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+           github.repository == '91270/WhateverXe' &&
+           github.ref == 'refs/heads/fix-tgl-s0-shared-irq-route-20261124')
         uses: actions/upload-artifact@v4
         with:
           name: 驱动构建产物
@@ -131,3 +138,58 @@ jobs:
           fi
           gh release edit "$RELEASE_TAG" --notes-file ../release-notes.md
           gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber
+
+  nightly:
+    name: 更新 Nightly 滚动预发布版本
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/fix-tgl-s0-shared-irq-route-20261124' &&
+      github.repository == '91270/WhateverXe'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: whateverxe-nightly
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: 下载 Nightly 构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: 驱动构建产物
+          path: dist
+      - name: 发布 Nightly 滚动预发布版本
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: nightly
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --prerelease --title "WhateverXe Nightly 每夜构建" \
+              --notes "基于提交 $GITHUB_SHA 自动构建的 Nightly 测试版本。" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --prerelease \
+              --title "WhateverXe Nightly 每夜构建" \
+              --notes "基于提交 $GITHUB_SHA 自动构建的 Nightly 测试版本。" --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          current_assets="$(printf '%s\n' *.zip SHA256SUMS)"
+          existing_assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' --repo "$GITHUB_REPOSITORY")"
+          while IFS= read -r asset_name; do
+            [[ -n "$asset_name" ]] || continue
+            if ! grep -Fxq "$asset_name" <<< "$current_assets"; then
+              gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes --repo "$GITHUB_REPOSITORY"
+              echo "已删除过期 Nightly 产物：$asset_name"
+            fi
+          done <<< "$existing_assets"
