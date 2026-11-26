@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.6
+
+Use with WhateverXe Graphics 0.4.5.
+
+### Added
+
+- On Tiger Lake laptops whose internal eDP display goes dark when macOS takes over from the boot screen, `-wex-tgl-edp-keep` lets you try keeping the firmware display mode. This can retain a lower color depth.
+
+### Fixed
+
+- Fix a timeout when re-establishing the internal eDP link after display sleep.
+- Fix incorrect color-depth signaling when macOS reuses an existing eDP or DisplayPort link.
+- Fix an unnecessary delay during DisplayPort link training on displays that advertise extended receiver capabilities.
+- Fix a hardware video processing stall that could occur if interrupt retry setup failed at startup.
+
 ## 0.8.5
 
 Update WhateverXe to 0.8.5 and keep WhateverXe Graphics at 0.4.5.
